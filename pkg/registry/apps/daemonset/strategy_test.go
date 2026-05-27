@@ -23,9 +23,9 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/validation/field"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
-	"k8s.io/apiserver/pkg/registry/rest"
+	podtest "k8s.io/kubernetes/pkg/api/pod/testing"
+	"k8s.io/kubernetes/pkg/apis/apps"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	"k8s.io/kubernetes/pkg/apis/extensions"
 )
 
 const (
@@ -34,60 +34,6 @@ const (
 	daemonsetName = "test-daemonset"
 	namespace     = "test-namespace"
 )
-
-func TestDaemonsetDefaultGarbageCollectionPolicy(t *testing.T) {
-	// Make sure we correctly implement the interface.
-	// Otherwise a typo could silently change the default.
-	var gcds rest.GarbageCollectionDeleteStrategy = Strategy
-	tests := []struct {
-		requestInfo      genericapirequest.RequestInfo
-		expectedGCPolicy rest.GarbageCollectionPolicy
-		isNilRequestInfo bool
-	}{
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "extensions",
-				APIVersion: "v1beta1",
-				Resource:   "daemonsets",
-			},
-			rest.OrphanDependents,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1beta2",
-				Resource:   "daemonsets",
-			},
-			rest.OrphanDependents,
-			false,
-		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "apps",
-				APIVersion: "v1",
-				Resource:   "daemonsets",
-			},
-			rest.DeleteDependents,
-			false,
-		},
-		{
-			expectedGCPolicy: rest.OrphanDependents,
-			isNilRequestInfo: true,
-		},
-	}
-
-	for _, test := range tests {
-		context := genericapirequest.NewContext()
-		if !test.isNilRequestInfo {
-			context = genericapirequest.WithRequestInfo(context, &test.requestInfo)
-		}
-		if got, want := gcds.DefaultGarbageCollectionPolicy(context), test.expectedGCPolicy; got != want {
-			t.Errorf("%s/%s: DefaultGarbageCollectionPolicy() = %#v, want %#v", test.requestInfo.APIGroup,
-				test.requestInfo.APIVersion, got, want)
-		}
-	}
-}
 
 func TestSelectorImmutability(t *testing.T) {
 	tests := []struct {
@@ -136,16 +82,6 @@ func TestSelectorImmutability(t *testing.T) {
 				},
 			},
 		},
-		{
-			genericapirequest.RequestInfo{
-				APIGroup:   "extensions",
-				APIVersion: "v1beta1",
-				Resource:   "daemonsets",
-			},
-			map[string]string{"a": "b"},
-			map[string]string{"c": "d"},
-			field.ErrorList{},
-		},
 	}
 
 	for _, test := range tests {
@@ -160,31 +96,40 @@ func TestSelectorImmutability(t *testing.T) {
 	}
 }
 
-func newDaemonSetWithSelectorLabels(selectorLabels map[string]string, templateGeneration int64) *extensions.DaemonSet {
-	return &extensions.DaemonSet{
+func TestValidateToleratingBadLabels(t *testing.T) {
+	oldObj := newDaemonSetWithSelectorLabels(map[string]string{"a": "b"}, 1)
+	oldObj.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "key", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"bad value"}}}
+	newObj := newDaemonSetWithSelectorLabels(map[string]string{"a": "b"}, 1)
+	newObj.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{Key: "key", Operator: metav1.LabelSelectorOpNotIn, Values: []string{"bad value"}}}
+
+	context := genericapirequest.NewContext()
+	errorList := daemonSetStrategy{}.ValidateUpdate(context, newObj, oldObj)
+	if len(errorList) > 0 {
+		t.Errorf("Unexpected error list with no-op update of bad object: %v", errorList)
+	}
+}
+
+func newDaemonSetWithSelectorLabels(selectorLabels map[string]string, templateGeneration int64) *apps.DaemonSet {
+	return &apps.DaemonSet{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            daemonsetName,
 			Namespace:       namespace,
 			ResourceVersion: "1",
 		},
-		Spec: extensions.DaemonSetSpec{
+		Spec: apps.DaemonSetSpec{
 			Selector: &metav1.LabelSelector{
 				MatchLabels:      selectorLabels,
 				MatchExpressions: []metav1.LabelSelectorRequirement{},
 			},
-			UpdateStrategy: extensions.DaemonSetUpdateStrategy{
-				Type: extensions.OnDeleteDaemonSetStrategyType,
+			UpdateStrategy: apps.DaemonSetUpdateStrategy{
+				Type: apps.OnDeleteDaemonSetStrategyType,
 			},
 			TemplateGeneration: templateGeneration,
 			Template: api.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{
 					Labels: selectorLabels,
 				},
-				Spec: api.PodSpec{
-					RestartPolicy: api.RestartPolicyAlways,
-					DNSPolicy:     api.DNSClusterFirst,
-					Containers:    []api.Container{{Name: fakeImageName, Image: fakeImage, ImagePullPolicy: "IfNotPresent", TerminationMessagePolicy: api.TerminationMessageReadFile}},
-				},
+				Spec: podtest.MakePodSpec(),
 			},
 		},
 	}

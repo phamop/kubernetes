@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
+
 // Unmarshal's a Containers description json file. The json file contains
 // an array of ContainerHint structs, each with a container's id and networkInterface
 // This allows collecting stats about network interfaces configured outside docker
@@ -21,13 +23,12 @@ package common
 import (
 	"encoding/json"
 	"flag"
-	"io/ioutil"
 	"os"
 )
 
 var ArgContainerHints = flag.String("container_hints", "/etc/cadvisor/container_hints.json", "location of the container hints file")
 
-type containerHints struct {
+type ContainerHints struct {
 	AllHosts []containerHint `json:"all_hosts,omitempty"`
 }
 
@@ -47,12 +48,12 @@ type networkInterface struct {
 	VethChild string `json:"veth_child,omitempty"`
 }
 
-func GetContainerHintsFromFile(containerHintsFile string) (containerHints, error) {
-	dat, err := ioutil.ReadFile(containerHintsFile)
+func GetContainerHintsFromFile(containerHintsFile string) (ContainerHints, error) {
+	dat, err := os.ReadFile(containerHintsFile)
 	if os.IsNotExist(err) {
-		return containerHints{}, nil
+		return ContainerHints{}, nil
 	}
-	var cHints containerHints
+	var cHints ContainerHints
 	if err == nil {
 		err = json.Unmarshal(dat, &cHints)
 	}

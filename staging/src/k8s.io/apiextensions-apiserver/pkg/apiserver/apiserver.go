@@ -17,46 +17,43 @@ limitations under the License.
 package apiserver
 
 import (
+	"context"
 	"fmt"
 	"net/http"
-	"os"
 	"time"
 
-	"github.com/golang/glog"
-
-	"k8s.io/apimachinery/pkg/apimachinery/announced"
-	"k8s.io/apimachinery/pkg/apimachinery/registered"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/install"
+	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
+	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
+	"k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
+	externalinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
+	"k8s.io/apiextensions-apiserver/pkg/controller/apiapproval"
+	"k8s.io/apiextensions-apiserver/pkg/controller/establish"
+	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
+	"k8s.io/apiextensions-apiserver/pkg/controller/nonstructuralschema"
+	openapicontroller "k8s.io/apiextensions-apiserver/pkg/controller/openapi"
+	openapiv3controller "k8s.io/apiextensions-apiserver/pkg/controller/openapiv3"
+	"k8s.io/apiextensions-apiserver/pkg/controller/status"
+	"k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/runtime/serializer"
-	"k8s.io/apimachinery/pkg/version"
+	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/apiserver/pkg/endpoints/discovery"
+	"k8s.io/apiserver/pkg/endpoints/discovery/aggregated"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic"
 	"k8s.io/apiserver/pkg/registry/rest"
 	genericapiserver "k8s.io/apiserver/pkg/server"
 	serverstorage "k8s.io/apiserver/pkg/server/storage"
-
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/install"
-	"k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1beta1"
-	"k8s.io/apiextensions-apiserver/pkg/client/clientset/internalclientset"
-	internalinformers "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion"
-	"k8s.io/apiextensions-apiserver/pkg/controller/finalizer"
-	"k8s.io/apiextensions-apiserver/pkg/controller/status"
-	"k8s.io/apiextensions-apiserver/pkg/registry/customresourcedefinition"
-
-	// make sure the generated client works
-	_ "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset"
-	_ "k8s.io/apiextensions-apiserver/pkg/client/informers/externalversions"
-	_ "k8s.io/apiextensions-apiserver/pkg/client/informers/internalversion"
+	"k8s.io/apiserver/pkg/util/webhook"
+	"k8s.io/klog/v2"
 )
 
 var (
-	groupFactoryRegistry = make(announced.APIGroupFactoryRegistry)
-	Registry             = registered.NewOrDie("")
-	Scheme               = runtime.NewScheme()
-	Codecs               = serializer.NewCodecFactory(Scheme)
+	Scheme = runtime.NewScheme()
+	Codecs = serializer.NewCodecFactory(Scheme)
 
 	// if you modify this, make sure you update the crEncoder
 	unversionedVersion = schema.GroupVersion{Group: "", Version: "v1"}
@@ -71,7 +68,7 @@ var (
 )
 
 func init() {
-	install.Install(groupFactoryRegistry, Registry, Scheme)
+	install.Install(Scheme)
 
 	// we need to add the options to empty v1
 	metav1.AddToGroupVersion(Scheme, schema.GroupVersion{Group: "", Version: "v1"})
@@ -81,6 +78,15 @@ func init() {
 
 type ExtraConfig struct {
 	CRDRESTOptionsGetter genericregistry.RESTOptionsGetter
+
+	// MasterCount is used to detect whether cluster is HA, and if it is
+	// the CRD Establishing will be hold by 5 seconds.
+	MasterCount int
+
+	// ServiceResolver is used in CR webhook converters to resolve webhook's service names
+	ServiceResolver webhook.ServiceResolver
+	// AuthResolverWrapper is used in CR webhook converters
+	AuthResolverWrapper webhook.AuthenticationInfoResolverWrapper
 }
 
 type Config struct {
@@ -102,7 +108,7 @@ type CustomResourceDefinitions struct {
 	GenericAPIServer *genericapiserver.GenericAPIServer
 
 	// provided for easier embedding
-	Informers internalinformers.SharedInformerFactory
+	Informers externalinformers.SharedInformerFactory
 }
 
 // Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
@@ -113,10 +119,6 @@ func (cfg *Config) Complete() CompletedConfig {
 	}
 
 	c.GenericConfig.EnableDiscovery = false
-	c.GenericConfig.Version = &version.Info{
-		Major: "0",
-		Minor: "1",
-	}
 
 	return CompletedConfig{&c}
 }
@@ -128,43 +130,44 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		return nil, err
 	}
 
+	// hasCRDInformerSyncedSignal is closed when the CRD informer this server uses has been fully synchronized.
+	// It ensures that requests to potential custom resource endpoints while the server hasn't installed all known HTTP paths get a 503 error instead of a 404
+	hasCRDInformerSyncedSignal := make(chan struct{})
+	if err := genericServer.RegisterMuxAndDiscoveryCompleteSignal("CRDInformerHasNotSynced", hasCRDInformerSyncedSignal); err != nil {
+		return nil, err
+	}
+
 	s := &CustomResourceDefinitions{
 		GenericAPIServer: genericServer,
 	}
 
 	apiResourceConfig := c.GenericConfig.MergedResourceConfig
-	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Registry, Scheme, metav1.ParameterCodec, Codecs)
-	if apiResourceConfig.VersionEnabled(v1beta1.SchemeGroupVersion) {
-		apiGroupInfo.GroupMeta.GroupVersion = v1beta1.SchemeGroupVersion
-		storage := map[string]rest.Storage{}
-		// customresourcedefinitions
-		customResourceDefintionStorage := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
-		storage["customresourcedefinitions"] = customResourceDefintionStorage
-		storage["customresourcedefinitions/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefintionStorage)
-
-		apiGroupInfo.VersionedResourcesStorageMap["v1beta1"] = storage
+	apiGroupInfo := genericapiserver.NewDefaultAPIGroupInfo(apiextensions.GroupName, Scheme, metav1.ParameterCodec, Codecs)
+	storage := map[string]rest.Storage{}
+	// customresourcedefinitions
+	if resource := "customresourcedefinitions"; apiResourceConfig.ResourceEnabled(v1.SchemeGroupVersion.WithResource(resource)) {
+		customResourceDefinitionStorage, err := customresourcedefinition.NewREST(Scheme, c.GenericConfig.RESTOptionsGetter)
+		if err != nil {
+			return nil, err
+		}
+		storage[resource] = customResourceDefinitionStorage
+		storage[resource+"/status"] = customresourcedefinition.NewStatusREST(Scheme, customResourceDefinitionStorage)
+	}
+	if len(storage) > 0 {
+		apiGroupInfo.VersionedResourcesStorageMap[v1.SchemeGroupVersion.Version] = storage
 	}
 
 	if err := s.GenericAPIServer.InstallAPIGroup(&apiGroupInfo); err != nil {
 		return nil, err
 	}
 
-	crdClient, err := internalclientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
+	crdClient, err := clientset.NewForConfig(s.GenericAPIServer.LoopbackClientConfig)
 	if err != nil {
 		// it's really bad that this is leaking here, but until we can fix the test (which I'm pretty sure isn't even testing what it wants to test),
 		// we need to be able to move forward
-		kubeAPIVersions := os.Getenv("KUBE_API_VERSIONS")
-		if len(kubeAPIVersions) == 0 {
-			return nil, fmt.Errorf("failed to create clientset: %v", err)
-		}
-
-		// KUBE_API_VERSIONS is used in test-update-storage-objects.sh, disabling a number of API
-		// groups. This leads to a nil client above and undefined behaviour further down.
-		//
-		// TODO: get rid of KUBE_API_VERSIONS or define sane behaviour if set
-		glog.Errorf("Failed to create clientset with KUBE_API_VERSIONS=%q. KUBE_API_VERSIONS is only for testing. Things will break.", kubeAPIVersions)
+		return nil, fmt.Errorf("failed to create clientset: %v", err)
 	}
-	s.Informers = internalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
+	s.Informers = externalinformers.NewSharedInformerFactory(crdClient, 5*time.Minute)
 
 	delegateHandler := delegationTarget.UnprotectedHandler()
 	if delegateHandler == nil {
@@ -179,40 +182,92 @@ func (c completedConfig) New(delegationTarget genericapiserver.DelegationTarget)
 		discovery: map[string]*discovery.APIGroupHandler{},
 		delegate:  delegateHandler,
 	}
-	crdHandler := NewCustomResourceDefinitionHandler(
+	establishingController := establish.NewEstablishingController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	crdHandler, err := NewCustomResourceDefinitionHandler(
 		versionDiscoveryHandler,
 		groupDiscoveryHandler,
-		s.GenericAPIServer.RequestContextMapper(),
-		s.Informers.Apiextensions().InternalVersion().CustomResourceDefinitions(),
+		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
 		delegateHandler,
 		c.ExtraConfig.CRDRESTOptionsGetter,
 		c.GenericConfig.AdmissionControl,
+		establishingController,
+		c.ExtraConfig.ServiceResolver,
+		c.ExtraConfig.AuthResolverWrapper,
+		c.ExtraConfig.MasterCount,
+		s.GenericAPIServer.Authorizer,
+		c.GenericConfig.RequestTimeout,
+		time.Duration(c.GenericConfig.MinRequestTimeout)*time.Second,
+		apiGroupInfo.StaticOpenAPISpec,
+		c.GenericConfig.MaxRequestBodyBytes,
 	)
+	if err != nil {
+		return nil, err
+	}
 	s.GenericAPIServer.Handler.NonGoRestfulMux.Handle("/apis", crdHandler)
 	s.GenericAPIServer.Handler.NonGoRestfulMux.HandlePrefix("/apis/", crdHandler)
+	s.GenericAPIServer.RegisterDestroyFunc(crdHandler.destroy)
 
-	// this only happens when KUBE_API_VERSIONS is set.  We must return without adding controllers or poststarthooks which would affect healthz
-	if crdClient == nil {
-		return s, nil
+	aggregatedDiscoveryManager := genericServer.AggregatedDiscoveryGroupManager
+	if aggregatedDiscoveryManager != nil {
+		aggregatedDiscoveryManager = aggregatedDiscoveryManager.WithSource(aggregated.CRDSource)
 	}
-
-	crdController := NewDiscoveryController(s.Informers.Apiextensions().InternalVersion().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler, c.GenericConfig.RequestContextMapper)
-	namingController := status.NewNamingConditionController(s.Informers.Apiextensions().InternalVersion().CustomResourceDefinitions(), crdClient.Apiextensions())
+	discoveryController := NewDiscoveryController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), versionDiscoveryHandler, groupDiscoveryHandler, aggregatedDiscoveryManager)
+	namingController := status.NewNamingConditionController(klog.TODO() /* for contextual logging */, s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	nonStructuralSchemaController := nonstructuralschema.NewConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
+	apiApprovalController := apiapproval.NewKubernetesAPIApprovalPolicyConformantConditionController(s.Informers.Apiextensions().V1().CustomResourceDefinitions(), crdClient.ApiextensionsV1())
 	finalizingController := finalizer.NewCRDFinalizer(
-		s.Informers.Apiextensions().InternalVersion().CustomResourceDefinitions(),
-		crdClient.Apiextensions(),
+		s.Informers.Apiextensions().V1().CustomResourceDefinitions(),
+		crdClient.ApiextensionsV1(),
 		crdHandler,
 	)
 
-	s.GenericAPIServer.AddPostStartHook("start-apiextensions-informers", func(context genericapiserver.PostStartHookContext) error {
-		s.Informers.Start(context.StopCh)
+	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-informers", func(hookContext genericapiserver.PostStartHookContext) error {
+		s.Informers.Start(hookContext.Done())
 		return nil
 	})
-	s.GenericAPIServer.AddPostStartHook("start-apiextensions-controllers", func(context genericapiserver.PostStartHookContext) error {
-		go crdController.Run(context.StopCh)
-		go namingController.Run(context.StopCh)
-		go finalizingController.Run(5, context.StopCh)
+	s.GenericAPIServer.AddPostStartHookOrDie("start-apiextensions-controllers", func(hookContext genericapiserver.PostStartHookContext) error {
+		// OpenAPIVersionedService and StaticOpenAPISpec are populated in generic apiserver PrepareRun().
+		// Together they serve the /openapi/v2 endpoint on a generic apiserver. A generic apiserver may
+		// choose to not enable OpenAPI by having null openAPIConfig, and thus OpenAPIVersionedService
+		// and StaticOpenAPISpec are both null. In that case we don't run the CRD OpenAPI controller.
+		if s.GenericAPIServer.StaticOpenAPISpec != nil {
+			if s.GenericAPIServer.OpenAPIVersionedService != nil {
+				openapiController := openapicontroller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+				go openapiController.Run(s.GenericAPIServer.StaticOpenAPISpec, s.GenericAPIServer.OpenAPIVersionedService, hookContext.Done())
+			}
+
+			if s.GenericAPIServer.OpenAPIV3VersionedService != nil {
+				openapiv3Controller := openapiv3controller.NewController(s.Informers.Apiextensions().V1().CustomResourceDefinitions())
+				go openapiv3Controller.Run(s.GenericAPIServer.OpenAPIV3VersionedService, hookContext.Done())
+			}
+		}
+
+		go namingController.RunWithContext(hookContext)
+		go establishingController.RunWithContext(hookContext)
+		go nonStructuralSchemaController.RunWithContext(5, hookContext)
+		go apiApprovalController.RunWithContext(5, hookContext)
+		go finalizingController.RunWithContext(5, hookContext)
+
+		discoverySyncedCh := make(chan struct{})
+		go discoveryController.Run(hookContext.Done(), discoverySyncedCh)
+		select {
+		case <-hookContext.Done():
+		case <-discoverySyncedCh:
+		}
+
 		return nil
+	})
+	// we don't want to report healthy until we can handle all CRDs that have already been registered.  Waiting for the informer
+	// to sync makes sure that the lister will be valid before we begin.  There may still be races for CRDs added after startup,
+	// but we won't go healthy until we can handle the ones already present.
+	s.GenericAPIServer.AddPostStartHookOrDie("crd-informer-synced", func(ctx genericapiserver.PostStartHookContext) error {
+		return wait.PollUntilContextCancel(ctx.Context, 100*time.Millisecond, true, func(ctx context.Context) (bool, error) {
+			if s.Informers.Apiextensions().V1().CustomResourceDefinitions().Informer().HasSynced() {
+				close(hasCRDInformerSyncedSignal)
+				return true, nil
+			}
+			return false, nil
+		})
 	})
 
 	return s, nil
@@ -223,6 +278,7 @@ func DefaultAPIResourceConfigSource() *serverstorage.ResourceConfig {
 	// NOTE: GroupVersions listed here will be enabled by default. Don't put alpha versions in the list.
 	ret.EnableVersions(
 		v1beta1.SchemeGroupVersion,
+		v1.SchemeGroupVersion,
 	)
 
 	return ret

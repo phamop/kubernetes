@@ -25,12 +25,15 @@ limitations under the License.
 package union
 
 import (
+	"context"
 	"strings"
 
 	utilerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 )
+
+var _ = authorizer.Authorizer(unionAuthzHandler{})
 
 // unionAuthzHandler authorizer against a chain of authorizer.Authorizer
 type unionAuthzHandler []authorizer.Authorizer
@@ -41,14 +44,14 @@ func New(authorizationHandlers ...authorizer.Authorizer) authorizer.Authorizer {
 }
 
 // Authorizes against a chain of authorizer.Authorizer objects and returns nil if successful and returns error if unsuccessful
-func (authzHandler unionAuthzHandler) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+func (authzHandler unionAuthzHandler) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	var (
 		errlist    []error
 		reasonlist []string
 	)
 
 	for _, currAuthzHandler := range authzHandler {
-		decision, reason, err := currAuthzHandler.Authorize(a)
+		decision, reason, err := currAuthzHandler.Authorize(ctx, a)
 
 		if err != nil {
 			errlist = append(errlist, err)
@@ -67,6 +70,16 @@ func (authzHandler unionAuthzHandler) Authorize(a authorizer.Attributes) (author
 	return authorizer.DecisionNoOpinion, strings.Join(reasonlist, "\n"), utilerrors.NewAggregate(errlist)
 }
 
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (authzHandler unionAuthzHandler) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(authzHandler.Authorize(ctx, a))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (unionAuthzHandler) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
+}
+
 // unionAuthzRulesHandler authorizer against a chain of authorizer.RuleResolver
 type unionAuthzRulesHandler []authorizer.RuleResolver
 
@@ -76,7 +89,7 @@ func NewRuleResolvers(authorizationHandlers ...authorizer.RuleResolver) authoriz
 }
 
 // RulesFor against a chain of authorizer.RuleResolver objects and returns nil if successful and returns error if unsuccessful
-func (authzHandler unionAuthzRulesHandler) RulesFor(user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
+func (authzHandler unionAuthzRulesHandler) RulesFor(ctx context.Context, user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
 	var (
 		errList              []error
 		resourceRulesList    []authorizer.ResourceRuleInfo
@@ -85,9 +98,9 @@ func (authzHandler unionAuthzRulesHandler) RulesFor(user user.Info, namespace st
 	incompleteStatus := false
 
 	for _, currAuthzHandler := range authzHandler {
-		resourceRules, nonResourceRules, incomplete, err := currAuthzHandler.RulesFor(user, namespace)
+		resourceRules, nonResourceRules, incomplete, err := currAuthzHandler.RulesFor(ctx, user, namespace)
 
-		if incomplete == true {
+		if incomplete {
 			incompleteStatus = true
 		}
 		if err != nil {

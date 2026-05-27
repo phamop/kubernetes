@@ -17,21 +17,22 @@ limitations under the License.
 package storageobjectinuseprotection
 
 import (
-	"fmt"
+	"context"
 	"reflect"
 	"testing"
-
-	"github.com/davecgh/go-spew/spew"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/util/version"
 	"k8s.io/apiserver/pkg/admission"
-	"k8s.io/apiserver/pkg/util/feature"
+	utilfeature "k8s.io/apiserver/pkg/util/feature"
+	featuregatetesting "k8s.io/component-base/featuregate/testing"
 	api "k8s.io/kubernetes/pkg/apis/core"
-	informers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion"
-	"k8s.io/kubernetes/pkg/controller"
+	storageapi "k8s.io/kubernetes/pkg/apis/storage"
+	"k8s.io/kubernetes/pkg/features"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/utils/dump"
 )
 
 func TestAdmit(t *testing.T) {
@@ -53,99 +54,130 @@ func TestAdmit(t *testing.T) {
 			Name: "pv",
 		},
 	}
+
+	vac := &storageapi.VolumeAttributesClass{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "VolumeAttributesClass",
+		},
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "vac",
+		},
+	}
+
 	claimWithFinalizer := claim.DeepCopy()
 	claimWithFinalizer.Finalizers = []string{volumeutil.PVCProtectionFinalizer}
 
 	pvWithFinalizer := pv.DeepCopy()
 	pvWithFinalizer.Finalizers = []string{volumeutil.PVProtectionFinalizer}
 
+	vacWithFinalizer := vac.DeepCopy()
+	vacWithFinalizer.Finalizers = []string{volumeutil.VACProtectionFinalizer}
+
 	tests := []struct {
-		name           string
-		resource       schema.GroupVersionResource
-		object         runtime.Object
-		expectedObject runtime.Object
-		featureEnabled bool
-		namespace      string
+		name                 string
+		resource             schema.GroupVersionResource
+		object               runtime.Object
+		expectedObject       runtime.Object
+		namespace            string
+		enableVacFeatureGate bool
 	}{
 		{
-			"create -> add finalizer",
+			"persistentvolumeclaims: create -> add finalizer",
 			api.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
 			claim,
 			claimWithFinalizer,
-			true,
 			claim.Namespace,
+			false,
 		},
 		{
-			"finalizer already exists -> no new finalizer",
+			"persistentvolumeclaims: finalizer already exists -> no new finalizer",
 			api.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
 			claimWithFinalizer,
 			claimWithFinalizer,
-			true,
 			claimWithFinalizer.Namespace,
-		},
-		{
-			"disabled feature -> no finalizer",
-			api.SchemeGroupVersion.WithResource("persistentvolumeclaims"),
-			claim,
-			claim,
 			false,
-			claim.Namespace,
 		},
 		{
-			"create -> add finalizer",
+			"persistentvolumes: create -> add finalizer",
 			api.SchemeGroupVersion.WithResource("persistentvolumes"),
 			pv,
 			pvWithFinalizer,
-			true,
 			pv.Namespace,
+			false,
 		},
 		{
-			"finalizer already exists -> no new finalizer",
+			"persistentvolumes: finalizer already exists -> no new finalizer",
 			api.SchemeGroupVersion.WithResource("persistentvolumes"),
 			pvWithFinalizer,
 			pvWithFinalizer,
-			true,
 			pvWithFinalizer.Namespace,
+			false,
 		},
 		{
-			"disabled feature -> no finalizer",
-			api.SchemeGroupVersion.WithResource("persistentvolumes"),
-			pv,
-			pv,
+			"volumeattributesclasses VacFeatureGate disabled: create -> no finalizer added",
+			storageapi.SchemeGroupVersion.WithResource("volumeattributesclasses"),
+			vac,
+			vac,
+			vac.Namespace,
 			false,
-			pv.Namespace,
+		},
+		{
+			"volumeattributesclasses VacFeatureGate disabled: finalizer already exists -> no new finalizer",
+			storageapi.SchemeGroupVersion.WithResource("volumeattributesclasses"),
+			vacWithFinalizer,
+			vacWithFinalizer,
+			vac.Namespace,
+			false,
+		},
+		{
+			"volumeattributesclasses VacFeatureGate enabled: create -> add finalizer",
+			storageapi.SchemeGroupVersion.WithResource("volumeattributesclasses"),
+			vac,
+			vacWithFinalizer,
+			vac.Namespace,
+			true,
+		},
+		{
+			"volumeattributesclasses VacFeatureGate enabled: finalizer already exists -> no new finalizer",
+			storageapi.SchemeGroupVersion.WithResource("volumeattributesclasses"),
+			vacWithFinalizer,
+			vacWithFinalizer,
+			vac.Namespace,
+			true,
 		},
 	}
-
-	ctrl := newPlugin()
-	informerFactory := informers.NewSharedInformerFactory(nil, controller.NoResyncPeriodFunc())
-	ctrl.SetInternalKubeInformerFactory(informerFactory)
 
 	for _, test := range tests {
-		feature.DefaultFeatureGate.Set(fmt.Sprintf("StorageObjectInUseProtection=%v", test.featureEnabled))
-		obj := test.object.DeepCopyObject()
-		attrs := admission.NewAttributesRecord(
-			obj,                  // new object
-			obj.DeepCopyObject(), // old object, copy to be sure it's not modified
-			schema.GroupVersionKind{},
-			test.namespace,
-			"foo",
-			test.resource,
-			"", // subresource
-			admission.Create,
-			nil, // userInfo
-		)
+		t.Run(test.name, func(t *testing.T) {
+			ctrl := newPlugin()
 
-		err := ctrl.Admit(attrs)
-		if err != nil {
-			t.Errorf("Test %q: got unexpected error: %v", test.name, err)
-		}
-		if !reflect.DeepEqual(test.expectedObject, obj) {
-			t.Errorf("Test %q: Expected object:\n%s\ngot:\n%s", test.name, spew.Sdump(test.expectedObject), spew.Sdump(obj))
-		}
+			if !test.enableVacFeatureGate {
+				featuregatetesting.SetFeatureGateEmulationVersionDuringTest(t, utilfeature.DefaultFeatureGate, version.MustParse("1.35"))
+			}
+			featuregatetesting.SetFeatureGateDuringTest(t, utilfeature.DefaultFeatureGate, features.VolumeAttributesClass, test.enableVacFeatureGate)
+
+			obj := test.object.DeepCopyObject()
+			attrs := admission.NewAttributesRecord(
+				obj,                  // new object
+				obj.DeepCopyObject(), // old object, copy to be sure it's not modified
+				schema.GroupVersionKind{},
+				test.namespace,
+				"foo",
+				test.resource,
+				"", // subresource
+				admission.Create,
+				&metav1.CreateOptions{},
+				false, // dryRun
+				nil,   // userInfo
+			)
+
+			err := ctrl.Admit(context.TODO(), attrs, nil)
+			if err != nil {
+				t.Errorf("Test %q: got unexpected error: %v", test.name, err)
+			}
+			if !reflect.DeepEqual(test.expectedObject, obj) {
+				t.Errorf("Test %q: Expected object:\n%s\ngot:\n%s", test.name, dump.Pretty(test.expectedObject), dump.Pretty(obj))
+			}
+		})
 	}
-
-	// Disable the feature for rest of the tests.
-	// TODO: remove after alpha
-	feature.DefaultFeatureGate.Set("StorageObjectInUseProtection=false")
 }

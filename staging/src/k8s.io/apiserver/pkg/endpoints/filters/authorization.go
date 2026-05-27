@@ -17,52 +17,86 @@ limitations under the License.
 package filters
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
+
+	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apiserver/pkg/audit"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	"k8s.io/apiserver/pkg/endpoints/handlers/responsewriters"
 	"k8s.io/apiserver/pkg/endpoints/request"
 )
 
-// WithAuthorizationCheck passes all authorized requests on to handler, and returns a forbidden error otherwise.
-func WithAuthorization(handler http.Handler, requestContextMapper request.RequestContextMapper, a authorizer.Authorizer, s runtime.NegotiatedSerializer) http.Handler {
+const (
+	// Annotation key names set in advanced audit
+	decisionAnnotationKey = "authorization.k8s.io/decision"
+	reasonAnnotationKey   = "authorization.k8s.io/reason"
+
+	// Annotation values set in advanced audit
+	decisionAllow  = "allow"
+	decisionForbid = "forbid"
+	reasonError    = "internal error"
+)
+
+type recordAuthorizationMetricsFunc func(ctx context.Context, authorized authorizer.Decision, err error, authStart time.Time, authFinish time.Time)
+
+// WithAuthorization passes all authorized requests on to handler, and returns a forbidden error otherwise.
+func WithAuthorization(hhandler http.Handler, auth authorizer.UnconditionalAuthorizer, s runtime.NegotiatedSerializer) http.Handler {
+	return withAuthorization(hhandler, auth, s, recordAuthorizationMetrics)
+}
+
+func withAuthorization(handler http.Handler, a authorizer.UnconditionalAuthorizer, s runtime.NegotiatedSerializer, metrics recordAuthorizationMetricsFunc) http.Handler {
 	if a == nil {
-		glog.Warningf("Authorization is disabled")
+		klog.Warning("Authorization is disabled")
 		return handler
 	}
 	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
-		ctx, ok := requestContextMapper.Get(req)
-		if !ok {
-			responsewriters.InternalError(w, req, errors.New("no context found for request"))
-			return
-		}
+		ctx := req.Context()
+		authorizationStart := time.Now()
 
 		attributes, err := GetAuthorizerAttributes(ctx)
 		if err != nil {
 			responsewriters.InternalError(w, req, err)
 			return
 		}
-		authorized, reason, err := a.Authorize(attributes)
+		authorized, reason, err := a.Authorize(ctx, attributes)
+
+		authorizationFinish := time.Now()
+		request.TrackAuthorizationLatency(ctx, authorizationFinish.Sub(authorizationStart))
+		defer func() {
+			metrics(ctx, authorized, err, authorizationStart, authorizationFinish)
+		}()
+
 		// an authorizer like RBAC could encounter evaluation errors and still allow the request, so authorizer decision is checked before error here.
 		if authorized == authorizer.DecisionAllow {
+			audit.AddAuditAnnotations(ctx,
+				decisionAnnotationKey, decisionAllow,
+				reasonAnnotationKey, reason)
 			handler.ServeHTTP(w, req)
 			return
 		}
 		if err != nil {
+			audit.AddAuditAnnotation(ctx, reasonAnnotationKey, reasonError)
 			responsewriters.InternalError(w, req, err)
 			return
 		}
 
-		glog.V(4).Infof("Forbidden: %#v, Reason: %q", req.RequestURI, reason)
-		responsewriters.Forbidden(ctx, attributes, w, req, reason, s)
+		klog.V(4).InfoS("Forbidden", "URI", req.RequestURI, "reason", reason)
+		audit.AddAuditAnnotations(ctx,
+			decisionAnnotationKey, decisionForbid,
+			reasonAnnotationKey, reason)
+		responsewriters.Forbidden(attributes, w, req, reason, s)
 	})
 }
 
-func GetAuthorizerAttributes(ctx request.Context) (authorizer.Attributes, error) {
+func GetAuthorizerAttributes(ctx context.Context) (authorizer.Attributes, error) {
 	attribs := authorizer.AttributesRecord{}
 
 	user, ok := request.UserFrom(ctx)
@@ -86,6 +120,30 @@ func GetAuthorizerAttributes(ctx request.Context) (authorizer.Attributes, error)
 	attribs.Subresource = requestInfo.Subresource
 	attribs.Namespace = requestInfo.Namespace
 	attribs.Name = requestInfo.Name
+
+	// parsing here makes it easy to keep the AttributesRecord type value-only and avoids any mutex copies when
+	// doing shallow copies in other steps.
+	if len(requestInfo.FieldSelector) > 0 {
+		fieldSelector, err := fields.ParseSelector(requestInfo.FieldSelector)
+		if err != nil {
+			attribs.FieldSelectorRequirements, attribs.FieldSelectorParsingErr = nil, err
+		} else {
+			if requirements := fieldSelector.Requirements(); len(requirements) > 0 {
+				attribs.FieldSelectorRequirements, attribs.FieldSelectorParsingErr = fieldSelector.Requirements(), nil
+			}
+		}
+	}
+
+	if len(requestInfo.LabelSelector) > 0 {
+		labelSelector, err := labels.Parse(requestInfo.LabelSelector)
+		if err != nil {
+			attribs.LabelSelectorRequirements, attribs.LabelSelectorParsingErr = nil, err
+		} else {
+			if requirements, _ /*selectable*/ := labelSelector.Requirements(); len(requirements) > 0 {
+				attribs.LabelSelectorRequirements, attribs.LabelSelectorParsingErr = requirements, nil
+			}
+		}
+	}
 
 	return &attribs, nil
 }

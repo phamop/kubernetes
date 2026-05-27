@@ -17,26 +17,27 @@ limitations under the License.
 package rest
 
 import (
+	"context"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
 	"net/url"
-	"os"
 	"reflect"
 	"testing"
 	"time"
 
-	"fmt"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	v1beta1 "k8s.io/api/extensions/v1beta1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/apimachinery/pkg/util/diff"
 	"k8s.io/client-go/kubernetes/scheme"
 	utiltesting "k8s.io/client-go/util/testing"
+	"k8s.io/klog/v2/ktesting"
+
+	"github.com/google/go-cmp/cmp"
 )
 
 type TestParam struct {
@@ -55,15 +56,17 @@ func TestSerializer(t *testing.T) {
 	contentConfig := ContentConfig{
 		ContentType:          "application/json",
 		GroupVersion:         &gv,
-		NegotiatedSerializer: serializer.DirectCodecFactory{CodecFactory: scheme.Codecs},
+		NegotiatedSerializer: scheme.Codecs.WithoutConversion(),
 	}
 
-	serializer, err := createSerializers(contentConfig)
+	n := runtime.NewClientNegotiator(contentConfig.NegotiatedSerializer, gv)
+	d, err := n.Decoder("application/json", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	// bytes based on actual return from API server when encoding an "unversioned" object
-	obj, err := runtime.Decode(serializer.Decoder, []byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success"}`))
+	obj, err := runtime.Decode(d, []byte(`{"kind":"Status","apiVersion":"v1","metadata":{},"status":"Success"}`))
 	t.Log(obj)
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +81,7 @@ func TestDoRequestSuccess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	body, err := c.Get().Prefix("test").Do().Raw()
+	body, err := c.Get().Prefix("test").Do(context.Background()).Raw()
 
 	testParam := TestParam{actualError: err, expectingError: false, expCreated: true,
 		expStatus: status, testBody: true, testBodyErrorIsNotNil: false}
@@ -106,7 +109,7 @@ func TestDoRequestFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	err = c.Get().Do().Error()
+	err = c.Get().Do(context.Background()).Error()
 	if err == nil {
 		t.Errorf("unexpected non-error")
 	}
@@ -116,7 +119,7 @@ func TestDoRequestFailed(t *testing.T) {
 	}
 	actual := ss.Status()
 	if !reflect.DeepEqual(status, &actual) {
-		t.Errorf("Unexpected mis-match: %s", diff.ObjectReflectDiff(status, &actual))
+		t.Errorf("Unexpected mis-match: %s", cmp.Diff(status, &actual))
 	}
 }
 
@@ -145,7 +148,7 @@ func TestDoRawRequestFailed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	body, err := c.Get().Do().Raw()
+	body, err := c.Get().Do(context.Background()).Raw()
 
 	if err == nil || body == nil {
 		t.Errorf("unexpected non-error: %#v", body)
@@ -156,7 +159,7 @@ func TestDoRawRequestFailed(t *testing.T) {
 	}
 	actual := ss.Status()
 	if !reflect.DeepEqual(status, &actual) {
-		t.Errorf("Unexpected mis-match: %s", diff.ObjectReflectDiff(status, &actual))
+		t.Errorf("Unexpected mis-match: %s", cmp.Diff(status, &actual))
 	}
 }
 
@@ -169,7 +172,7 @@ func TestDoRequestCreated(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	created := false
-	body, err := c.Get().Prefix("test").Do().WasCreated(&created).Raw()
+	body, err := c.Get().Prefix("test").Do(context.Background()).WasCreated(&created).Raw()
 
 	testParam := TestParam{actualError: err, expectingError: false, expCreated: true,
 		expStatus: status, testBody: false}
@@ -184,7 +187,7 @@ func TestDoRequestNotCreated(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	created := false
-	body, err := c.Get().Prefix("test").Do().WasCreated(&created).Raw()
+	body, err := c.Get().Prefix("test").Do(context.Background()).WasCreated(&created).Raw()
 	testParam := TestParam{actualError: err, expectingError: false, expCreated: false,
 		expStatus: expectedStatus, testBody: false}
 	validate(testParam, t, body, fakeHandler)
@@ -199,7 +202,7 @@ func TestDoRequestAcceptedNoContentReturned(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	created := false
-	body, err := c.Get().Prefix("test").Do().WasCreated(&created).Raw()
+	body, err := c.Get().Prefix("test").Do(context.Background()).WasCreated(&created).Raw()
 	testParam := TestParam{actualError: err, expectingError: false, expCreated: false,
 		testBody: false}
 	validate(testParam, t, body, fakeHandler)
@@ -213,7 +216,7 @@ func TestBadRequest(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	created := false
-	body, err := c.Get().Prefix("test").Do().WasCreated(&created).Raw()
+	body, err := c.Get().Prefix("test").Do(context.Background()).WasCreated(&created).Raw()
 	testParam := TestParam{actualError: err, expectingError: true, expCreated: false,
 		testBody: true}
 	validate(testParam, t, body, fakeHandler)
@@ -250,7 +253,7 @@ func validate(testParam TestParam, t *testing.T, body []byte, fakeHandler *utilt
 
 }
 
-func TestHttpMethods(t *testing.T) {
+func TestHTTPMethods(t *testing.T) {
 	testServer, _, _ := testServerEnv(t, 200)
 	defer testServer.Close()
 	c, _ := restClient(testServer)
@@ -281,37 +284,88 @@ func TestHttpMethods(t *testing.T) {
 	}
 }
 
-func TestCreateBackoffManager(t *testing.T) {
+func TestHTTPProxy(t *testing.T) {
+	ctx := context.Background()
+	testServer, fh, _ := testServerEnv(t, 200)
+	fh.ResponseBody = "backend data"
+	defer testServer.Close()
 
+	testProxyServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		to, err := url.Parse(req.RequestURI)
+		if err != nil {
+			t.Fatalf("err: %v", err)
+		}
+		w.Write([]byte("proxied: "))
+		httputil.NewSingleHostReverseProxy(to).ServeHTTP(w, req)
+	}))
+	defer testProxyServer.Close()
+
+	t.Log(testProxyServer.URL)
+
+	u, err := url.Parse(testProxyServer.URL)
+	if err != nil {
+		t.Fatalf("Failed to parse test proxy server url: %v", err)
+	}
+
+	c, err := RESTClientFor(&Config{
+		Host: testServer.URL,
+		ContentConfig: ContentConfig{
+			GroupVersion:         &v1.SchemeGroupVersion,
+			NegotiatedSerializer: scheme.Codecs.WithoutConversion(),
+		},
+		Proxy:    http.ProxyURL(u),
+		Username: "user",
+		Password: "pass",
+	})
+	if err != nil {
+		t.Fatalf("Failed to create client: %v", err)
+	}
+
+	request := c.Get()
+	if request == nil {
+		t.Fatalf("Get: Object returned should not be nil")
+	}
+
+	b, err := request.DoRaw(ctx)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if got, want := string(b), "proxied: backend data"; !cmp.Equal(got, want) {
+		t.Errorf("unexpected body: %v", cmp.Diff(want, got))
+	}
+}
+
+func TestCreateBackoffManager(t *testing.T) {
+	_, ctx := ktesting.NewTestContext(t)
 	theUrl, _ := url.Parse("http://localhost")
 
 	// 1 second base backoff + duration of 2 seconds -> exponential backoff for requests.
-	os.Setenv(envBackoffBase, "1")
-	os.Setenv(envBackoffDuration, "2")
+	t.Setenv(envBackoffBase, "1")
+	t.Setenv(envBackoffDuration, "2")
 	backoff := readExpBackoffConfig()
-	backoff.UpdateBackoff(theUrl, nil, 500)
-	backoff.UpdateBackoff(theUrl, nil, 500)
-	if backoff.CalculateBackoff(theUrl)/time.Second != 2 {
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
+	if backoff.CalculateBackoffWithContext(ctx, theUrl)/time.Second != 2 {
 		t.Errorf("Backoff env not working.")
 	}
 
 	// 0 duration -> no backoff.
-	os.Setenv(envBackoffBase, "1")
-	os.Setenv(envBackoffDuration, "0")
-	backoff.UpdateBackoff(theUrl, nil, 500)
-	backoff.UpdateBackoff(theUrl, nil, 500)
+	t.Setenv(envBackoffBase, "1")
+	t.Setenv(envBackoffDuration, "0")
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
 	backoff = readExpBackoffConfig()
-	if backoff.CalculateBackoff(theUrl)/time.Second != 0 {
+	if backoff.CalculateBackoffWithContext(ctx, theUrl)/time.Second != 0 {
 		t.Errorf("Zero backoff duration, but backoff still occurring.")
 	}
 
 	// No env -> No backoff.
-	os.Setenv(envBackoffBase, "")
-	os.Setenv(envBackoffDuration, "")
+	t.Setenv(envBackoffBase, "")
+	t.Setenv(envBackoffDuration, "")
 	backoff = readExpBackoffConfig()
-	backoff.UpdateBackoff(theUrl, nil, 500)
-	backoff.UpdateBackoff(theUrl, nil, 500)
-	if backoff.CalculateBackoff(theUrl)/time.Second != 0 {
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
+	backoff.UpdateBackoffWithContext(ctx, theUrl, nil, 500)
+	if backoff.CalculateBackoffWithContext(ctx, theUrl)/time.Second != 0 {
 		t.Errorf("Backoff should have been 0.")
 	}
 
@@ -334,7 +388,7 @@ func restClient(testServer *httptest.Server) (*RESTClient, error) {
 		Host: testServer.URL,
 		ContentConfig: ContentConfig{
 			GroupVersion:         &v1.SchemeGroupVersion,
-			NegotiatedSerializer: serializer.DirectCodecFactory{CodecFactory: scheme.Codecs},
+			NegotiatedSerializer: scheme.Codecs.WithoutConversion(),
 		},
 		Username: "user",
 		Password: "pass",

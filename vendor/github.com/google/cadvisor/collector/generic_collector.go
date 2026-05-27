@@ -17,7 +17,7 @@ package collector
 import (
 	"encoding/json"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -25,7 +25,7 @@ import (
 	"time"
 
 	"github.com/google/cadvisor/container"
-	"github.com/google/cadvisor/info/v1"
+	v1 "github.com/google/cadvisor/info/v1"
 )
 
 type GenericCollector struct {
@@ -67,7 +67,7 @@ func NewCollector(collectorName string, configFile []byte, metricCountLimit int,
 	// TODO : Add checks for validity of config file (eg : Accurate JSON fields)
 
 	if len(configInJSON.MetricsConfig) == 0 {
-		return nil, fmt.Errorf("No metrics provided in config")
+		return nil, fmt.Errorf("no metrics provided in config")
 	}
 
 	minPollFrequency := time.Duration(0)
@@ -83,7 +83,7 @@ func NewCollector(collectorName string, configFile []byte, metricCountLimit int,
 
 		regexprs[ind], err = regexp.Compile(metricConfig.Regex)
 		if err != nil {
-			return nil, fmt.Errorf("Invalid regexp %v for metric %v", metricConfig.Regex, metricConfig.Name)
+			return nil, fmt.Errorf("invalid regexp %v for metric %v", metricConfig.Regex, metricConfig.Name)
 		}
 	}
 
@@ -94,7 +94,7 @@ func NewCollector(collectorName string, configFile []byte, metricCountLimit int,
 	}
 
 	if len(configInJSON.MetricsConfig) > metricCountLimit {
-		return nil, fmt.Errorf("Too many metrics defined: %d limit: %d", len(configInJSON.MetricsConfig), metricCountLimit)
+		return nil, fmt.Errorf("too many metrics defined: %d limit: %d", len(configInJSON.MetricsConfig), metricCountLimit)
 	}
 
 	return &GenericCollector{
@@ -145,7 +145,7 @@ func (collector *GenericCollector) Collect(metrics map[string][]v1.MetricVal) (t
 
 	defer response.Body.Close()
 
-	pageContent, err := ioutil.ReadAll(response.Body)
+	pageContent, err := io.ReadAll(response.Body)
 	if err != nil {
 		return nextCollectionTime, nil, err
 	}
@@ -173,10 +173,10 @@ func (collector *GenericCollector) Collect(metrics map[string][]v1.MetricVal) (t
 				}
 
 			} else {
-				errorSlice = append(errorSlice, fmt.Errorf("Unexpected value of 'data_type' for metric '%v' in config ", metricConfig.Name))
+				errorSlice = append(errorSlice, fmt.Errorf("unexpected value of 'data_type' for metric '%v' in config ", metricConfig.Name))
 			}
 		} else {
-			errorSlice = append(errorSlice, fmt.Errorf("No match found for regexp: %v for metric '%v' in config", metricConfig.Regex, metricConfig.Name))
+			errorSlice = append(errorSlice, fmt.Errorf("no match found for regexp: %v for metric '%v' in config", metricConfig.Regex, metricConfig.Name))
 		}
 	}
 	return nextCollectionTime, metrics, compileErrors(errorSlice)

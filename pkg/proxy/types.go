@@ -19,13 +19,19 @@ package proxy
 import (
 	"fmt"
 
+	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
-	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/proxy/config"
 )
 
-// ProxyProvider is the interface provided by proxier implementations.
-type ProxyProvider interface {
-	// Sync immediately synchronizes the ProxyProvider's current state to proxy rules.
+// Provider is the interface provided by proxier implementations.
+type Provider interface {
+	config.EndpointSliceHandler
+	config.ServiceHandler
+	config.NodeTopologyHandler
+	config.ServiceCIDRHandler
+
+	// Sync immediately synchronizes the Provider's current state to proxy rules.
 	Sync()
 	// SyncLoop runs periodic work.
 	// This is expected to run as a goroutine or as the main loop of the app.
@@ -37,36 +43,19 @@ type ProxyProvider interface {
 // identifier for a load-balanced service.
 type ServicePortName struct {
 	types.NamespacedName
-	Port string
+	Port     string
+	Protocol v1.Protocol
 }
 
 func (spn ServicePortName) String() string {
-	return fmt.Sprintf("%s:%s", spn.NamespacedName.String(), spn.Port)
+	return fmt.Sprintf("%s%s", spn.NamespacedName.String(), fmtPortName(spn.Port))
 }
 
-// ServicePort is an interface which abstracts information about a service.
-type ServicePort interface {
-	// String returns service string.  An example format can be: `IP:Port/Protocol`.
-	String() string
-	// ClusterIP returns service cluster IP.
-	ClusterIP() string
-	// Protocol returns service protocol.
-	Protocol() api.Protocol
-	// HealthCheckNodePort returns service health check node port if present.  If return 0, it means not present.
-	HealthCheckNodePort() int
-}
-
-// Endpoint in an interface which abstracts information about an endpoint.
-type Endpoint interface {
-	// String returns endpoint string.  An example format can be: `IP:Port`.
-	// We take the returned value as ServiceEndpoint.Endpoint.
-	String() string
-	// IsLocal returns true if the endpoint is running in same host as kube-proxy, otherwise returns false.
-	IsLocal() bool
-	// IP returns IP part of endpoints.
-	IP() string
-	// Equal checks if two endpoints are equal.
-	Equal(Endpoint) bool
+func fmtPortName(in string) string {
+	if in == "" {
+		return ""
+	}
+	return fmt.Sprintf(":%s", in)
 }
 
 // ServiceEndpoint is used to identify a service and one of its endpoint pair.

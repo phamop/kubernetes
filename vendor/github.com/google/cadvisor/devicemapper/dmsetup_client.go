@@ -11,6 +11,7 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package devicemapper
 
 import (
@@ -18,7 +19,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
 
 // DmsetupClient is a low-level client for interacting with device mapper via
@@ -58,6 +59,6 @@ func (c *defaultDmsetupClient) Status(deviceName string) ([]byte, error) {
 }
 
 func (*defaultDmsetupClient) dmsetup(args ...string) ([]byte, error) {
-	glog.V(5).Infof("running dmsetup %v", strings.Join(args, " "))
+	klog.V(5).Infof("running dmsetup %v", strings.Join(args, " "))
 	return exec.Command("dmsetup", args...).Output()
 }

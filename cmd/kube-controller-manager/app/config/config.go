@@ -17,25 +17,45 @@ limitations under the License.
 package config
 
 import (
+	apiserver "k8s.io/apiserver/pkg/server"
+	"k8s.io/apiserver/pkg/server/flagz"
+	clientset "k8s.io/client-go/kubernetes"
+	restclient "k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/record"
+	basecompatibility "k8s.io/component-base/compatibility"
+	kubectrlmgrconfig "k8s.io/kubernetes/pkg/controller/apis/config"
 	"time"
-
-	genericcontrollermanager "k8s.io/kubernetes/cmd/controller-manager/app"
 )
-
-// ExtraConfig are part of Config, also can place your custom config here.
-type ExtraConfig struct {
-	NodeStatusUpdateFrequency time.Duration
-}
 
 // Config is the main context object for the controller manager.
 type Config struct {
-	Generic genericcontrollermanager.Config
-	Extra   ExtraConfig
+	// Flagz is the Reader interface to get flags for the flagz page.
+	Flagz flagz.Reader
+
+	ComponentConfig kubectrlmgrconfig.KubeControllerManagerConfiguration
+
+	SecureServing *apiserver.SecureServingInfo
+
+	Authentication apiserver.AuthenticationInfo
+	Authorization  apiserver.AuthorizationInfo
+
+	// the general kube client
+	Client *clientset.Clientset
+
+	// the rest config for the master
+	Kubeconfig *restclient.Config
+
+	EventBroadcaster record.EventBroadcaster
+	EventRecorder    record.EventRecorder
+
+	ControllerShutdownTimeout time.Duration
+
+	// ComponentGlobalsRegistry is the registry where the effective versions and feature gates for all components are stored.
+	ComponentGlobalsRegistry basecompatibility.ComponentGlobalsRegistry
 }
 
 type completedConfig struct {
-	Generic genericcontrollermanager.CompletedConfig
-	Extra   *ExtraConfig
+	*Config
 }
 
 // CompletedConfig same as Config, just to swap private object.
@@ -46,10 +66,7 @@ type CompletedConfig struct {
 
 // Complete fills in any fields not set that are required to have valid data. It's mutating the receiver.
 func (c *Config) Complete() *CompletedConfig {
-	cc := completedConfig{
-		c.Generic.Complete(),
-		&c.Extra,
-	}
+	cc := completedConfig{c}
 
 	return &CompletedConfig{&cc}
 }

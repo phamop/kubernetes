@@ -28,7 +28,7 @@ import (
 	"github.com/prometheus/common/model"
 
 	"github.com/google/cadvisor/container"
-	"github.com/google/cadvisor/info/v1"
+	v1 "github.com/google/cadvisor/info/v1"
 )
 
 type PrometheusCollector struct {
@@ -72,7 +72,7 @@ func NewPrometheusCollector(collectorName string, configFile []byte, metricCount
 	}
 
 	if metricCountLimit < 0 {
-		return nil, fmt.Errorf("Metric count limit must be greater than or equal to 0")
+		return nil, fmt.Errorf("metric count limit must be greater than or equal to 0")
 	}
 
 	var metricsSet map[string]bool
@@ -84,7 +84,7 @@ func NewPrometheusCollector(collectorName string, configFile []byte, metricCount
 	}
 
 	if len(configInJSON.MetricsConfig) > metricCountLimit {
-		return nil, fmt.Errorf("Too many metrics defined: %d limit %d", len(configInJSON.MetricsConfig), metricCountLimit)
+		return nil, fmt.Errorf("too many metrics defined: %d limit %d", len(configInJSON.MetricsConfig), metricCountLimit)
 	}
 
 	// TODO : Add checks for validity of config file (eg : Accurate JSON fields)
@@ -184,6 +184,17 @@ func (s byName) Less(i, j int) bool {
 	return s.prometheusLabels[i].GetName() < s.prometheusLabels[j].GetName()
 }
 
+func prometheusLabelSetToCadvisorLabels(promLabels model.Metric) map[string]string {
+	labels := make(map[string]string)
+	for k, v := range promLabels {
+		if string(k) == "__name__" {
+			continue
+		}
+		labels[string(k)] = string(v)
+	}
+	return labels
+}
+
 func prometheusLabelSetToCadvisorLabel(promLabels model.Metric) string {
 	labels := labelSetToLabelPairs(promLabels)
 	sort.Sort(byName{labels})
@@ -198,7 +209,7 @@ func prometheusLabelSetToCadvisorLabel(promLabels model.Metric) string {
 		b.WriteString(l.GetValue())
 	}
 
-	return string(b.Bytes())
+	return b.String()
 }
 
 // Returns collected metrics and the next collection time of the collector
@@ -247,11 +258,13 @@ func (collector *PrometheusCollector) Collect(metrics map[string][]v1.MetricVal)
 			// TODO Handle multiple labels nicer. Prometheus metrics can have multiple
 			// labels, cadvisor only accepts a single string for the metric label.
 			label := prometheusLabelSetToCadvisorLabel(sample.Metric)
+			labels := prometheusLabelSetToCadvisorLabels(sample.Metric)
 
 			metric := v1.MetricVal{
 				FloatValue: float64(sample.Value),
 				Timestamp:  sample.Timestamp.Time(),
 				Label:      label,
+				Labels:     labels,
 			}
 			newMetrics[metName] = append(newMetrics[metName], metric)
 			if len(newMetrics) > collector.metricCountLimit {

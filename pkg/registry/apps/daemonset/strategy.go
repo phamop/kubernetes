@@ -17,44 +17,36 @@ limitations under the License.
 package daemonset
 
 import (
-	appsv1beta2 "k8s.io/api/apps/v1beta2"
-	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
+	"context"
+
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	apivalidation "k8s.io/apimachinery/pkg/api/validation"
+	metav1validation "k8s.io/apimachinery/pkg/apis/meta/v1/validation"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation/field"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 	"k8s.io/apiserver/pkg/registry/rest"
 	"k8s.io/apiserver/pkg/storage/names"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
 	"k8s.io/kubernetes/pkg/api/pod"
-	"k8s.io/kubernetes/pkg/apis/extensions"
-	"k8s.io/kubernetes/pkg/apis/extensions/validation"
+	"k8s.io/kubernetes/pkg/apis/apps"
+	"k8s.io/kubernetes/pkg/apis/apps/validation"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // daemonSetStrategy implements verification logic for daemon sets.
 type daemonSetStrategy struct {
-	runtime.ObjectTyper
+	rest.DeclarativeValidation
 	names.NameGenerator
 }
 
 // Strategy is the default logic that applies when creating and updating DaemonSet objects.
-var Strategy = daemonSetStrategy{legacyscheme.Scheme, names.SimpleNameGenerator}
+var Strategy = daemonSetStrategy{rest.DeclarativeValidation{Scheme: legacyscheme.Scheme}, names.SimpleNameGenerator}
 
-// DefaultGarbageCollectionPolicy returns OrphanDependents by default. For apps/v1, returns DeleteDependents.
-func (daemonSetStrategy) DefaultGarbageCollectionPolicy(ctx genericapirequest.Context) rest.GarbageCollectionPolicy {
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion, appsv1beta2.SchemeGroupVersion:
-			// for back compatibility
-			return rest.OrphanDependents
-		default:
-			return rest.DeleteDependents
-		}
-	}
-	return rest.OrphanDependents
+// Make sure we correctly implement the interface.
+var _ = rest.GarbageCollectionDeleteStrategy(Strategy)
+
+// DefaultGarbageCollectionPolicy returns DeleteDependents for all currently served versions.
+func (daemonSetStrategy) DefaultGarbageCollectionPolicy(ctx context.Context) rest.GarbageCollectionPolicy {
+	return rest.DeleteDependents
 }
 
 // NamespaceScoped returns true because all DaemonSets need to be within a namespace.
@@ -62,26 +54,37 @@ func (daemonSetStrategy) NamespaceScoped() bool {
 	return true
 }
 
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (daemonSetStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	fields := map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("status"),
+		),
+	}
+
+	return fields
+}
+
 // PrepareForCreate clears the status of a daemon set before creation.
-func (daemonSetStrategy) PrepareForCreate(ctx genericapirequest.Context, obj runtime.Object) {
-	daemonSet := obj.(*extensions.DaemonSet)
-	daemonSet.Status = extensions.DaemonSetStatus{}
+func (daemonSetStrategy) PrepareForCreate(ctx context.Context, obj runtime.Object) {
+	daemonSet := obj.(*apps.DaemonSet)
+	daemonSet.Status = apps.DaemonSetStatus{}
 
 	daemonSet.Generation = 1
 	if daemonSet.Spec.TemplateGeneration < 1 {
 		daemonSet.Spec.TemplateGeneration = 1
 	}
 
-	pod.DropDisabledAlphaFields(&daemonSet.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&daemonSet.Spec.Template, nil)
 }
 
 // PrepareForUpdate clears fields that are not allowed to be set by end users on update.
-func (daemonSetStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
-	newDaemonSet := obj.(*extensions.DaemonSet)
-	oldDaemonSet := old.(*extensions.DaemonSet)
+func (daemonSetStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newDaemonSet := obj.(*apps.DaemonSet)
+	oldDaemonSet := old.(*apps.DaemonSet)
 
-	pod.DropDisabledAlphaFields(&newDaemonSet.Spec.Template.Spec)
-	pod.DropDisabledAlphaFields(&oldDaemonSet.Spec.Template.Spec)
+	pod.DropDisabledTemplateFields(&newDaemonSet.Spec.Template, &oldDaemonSet.Spec.Template)
 
 	// update is not allowed to set status
 	newDaemonSet.Status = oldDaemonSet.Status
@@ -111,9 +114,16 @@ func (daemonSetStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, ol
 }
 
 // Validate validates a new daemon set.
-func (daemonSetStrategy) Validate(ctx genericapirequest.Context, obj runtime.Object) field.ErrorList {
-	daemonSet := obj.(*extensions.DaemonSet)
-	return validation.ValidateDaemonSet(daemonSet)
+func (daemonSetStrategy) Validate(ctx context.Context, obj runtime.Object) field.ErrorList {
+	daemonSet := obj.(*apps.DaemonSet)
+	opts := pod.GetValidationOptionsFromPodTemplate(&daemonSet.Spec.Template, nil)
+	return validation.ValidateDaemonSet(daemonSet, opts)
+}
+
+// WarningsOnCreate returns warnings for the creation of the given object.
+func (daemonSetStrategy) WarningsOnCreate(ctx context.Context, obj runtime.Object) []string {
+	newDaemonSet := obj.(*apps.DaemonSet)
+	return pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newDaemonSet.Spec.Template, nil)
 }
 
 // Canonicalize normalizes the object after validation.
@@ -122,37 +132,34 @@ func (daemonSetStrategy) Canonicalize(obj runtime.Object) {
 
 // AllowCreateOnUpdate is false for daemon set; this means a POST is
 // needed to create one
-func (daemonSetStrategy) AllowCreateOnUpdate() bool {
+func (daemonSetStrategy) AllowCreateOnUpdate(ctx context.Context) bool {
 	return false
 }
 
 // ValidateUpdate is the default update validation for an end user.
-func (daemonSetStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	newDaemonSet := obj.(*extensions.DaemonSet)
-	oldDaemonSet := old.(*extensions.DaemonSet)
-	allErrs := validation.ValidateDaemonSet(obj.(*extensions.DaemonSet))
-	allErrs = append(allErrs, validation.ValidateDaemonSetUpdate(newDaemonSet, oldDaemonSet)...)
+func (daemonSetStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	newDaemonSet := obj.(*apps.DaemonSet)
+	oldDaemonSet := old.(*apps.DaemonSet)
 
-	// Update is not allowed to set Spec.Selector for apps/v1 and apps/v1beta2 (allowed for extensions/v1beta1).
-	// If RequestInfo is nil, it is better to revert to old behavior (i.e. allow update to set Spec.Selector)
-	// to prevent unintentionally breaking users who may rely on the old behavior.
-	// TODO(#50791): after extensions/v1beta1 is removed, move selector immutability check inside ValidateDaemonSetUpdate().
-	if requestInfo, found := genericapirequest.RequestInfoFrom(ctx); found {
-		groupVersion := schema.GroupVersion{Group: requestInfo.APIGroup, Version: requestInfo.APIVersion}
-		switch groupVersion {
-		case extensionsv1beta1.SchemeGroupVersion:
-			// no-op for compatibility
-		default:
-			// disallow mutation of selector
-			allErrs = append(allErrs, apivalidation.ValidateImmutableField(newDaemonSet.Spec.Selector, oldDaemonSet.Spec.Selector, field.NewPath("spec").Child("selector"))...)
-		}
+	opts := pod.GetValidationOptionsFromPodTemplate(&newDaemonSet.Spec.Template, &oldDaemonSet.Spec.Template)
+	opts.AllowInvalidLabelValueInSelector = opts.AllowInvalidLabelValueInSelector || metav1validation.LabelSelectorHasInvalidLabelValue(oldDaemonSet.Spec.Selector)
+
+	return validation.ValidateDaemonSetUpdate(newDaemonSet, oldDaemonSet, opts)
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (daemonSetStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	var warnings []string
+	newDaemonSet := obj.(*apps.DaemonSet)
+	oldDaemonSet := old.(*apps.DaemonSet)
+	if newDaemonSet.Spec.TemplateGeneration != oldDaemonSet.Spec.TemplateGeneration {
+		warnings = pod.GetWarningsForPodTemplate(ctx, field.NewPath("spec", "template"), &newDaemonSet.Spec.Template, &oldDaemonSet.Spec.Template)
 	}
-
-	return allErrs
+	return warnings
 }
 
 // AllowUnconditionalUpdate is the default update policy for daemon set objects.
-func (daemonSetStrategy) AllowUnconditionalUpdate() bool {
+func (daemonSetStrategy) AllowUnconditionalUpdate(ctx context.Context) bool {
 	return true
 }
 
@@ -160,14 +167,30 @@ type daemonSetStatusStrategy struct {
 	daemonSetStrategy
 }
 
+// StatusStrategy is the default logic invoked when updating object status.
 var StatusStrategy = daemonSetStatusStrategy{Strategy}
 
-func (daemonSetStatusStrategy) PrepareForUpdate(ctx genericapirequest.Context, obj, old runtime.Object) {
-	newDaemonSet := obj.(*extensions.DaemonSet)
-	oldDaemonSet := old.(*extensions.DaemonSet)
+// GetResetFields returns the set of fields that get reset by the strategy
+// and should not be modified by the user.
+func (daemonSetStatusStrategy) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return map[fieldpath.APIVersion]*fieldpath.Set{
+		"apps/v1": fieldpath.NewSet(
+			fieldpath.MakePathOrDie("spec"),
+		),
+	}
+}
+
+func (daemonSetStatusStrategy) PrepareForUpdate(ctx context.Context, obj, old runtime.Object) {
+	newDaemonSet := obj.(*apps.DaemonSet)
+	oldDaemonSet := old.(*apps.DaemonSet)
 	newDaemonSet.Spec = oldDaemonSet.Spec
 }
 
-func (daemonSetStatusStrategy) ValidateUpdate(ctx genericapirequest.Context, obj, old runtime.Object) field.ErrorList {
-	return validation.ValidateDaemonSetStatusUpdate(obj.(*extensions.DaemonSet), old.(*extensions.DaemonSet))
+func (daemonSetStatusStrategy) ValidateUpdate(ctx context.Context, obj, old runtime.Object) field.ErrorList {
+	return validation.ValidateDaemonSetStatusUpdate(obj.(*apps.DaemonSet), old.(*apps.DaemonSet))
+}
+
+// WarningsOnUpdate returns warnings for the given update.
+func (daemonSetStatusStrategy) WarningsOnUpdate(ctx context.Context, obj, old runtime.Object) []string {
+	return nil
 }

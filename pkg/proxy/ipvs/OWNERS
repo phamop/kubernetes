@@ -1,8 +1,18 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 reviewers:
-- thockin
-- brendandburns
-- m1093782566
+  - sig-network-reviewers
+  - andrewsykim
+  - aroradaman
+  - uablrek
 approvers:
-- thockin
-- brendandburns
-- m1093782566
+  - sig-network-approvers
+  - andrewsykim
+  - uablrek
+labels:
+  - sig/network
+  - area/ipvs
+emeritus_approvers:
+  - brendandburns
+  - lbernail
+  - m1093782566

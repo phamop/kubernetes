@@ -30,38 +30,129 @@ import (
 const (
 	maxLengthErrMsg = "must be no more than"
 	namePartErrMsg  = "name part must consist of"
-	nameErrMsg      = "a qualified name must consist of"
+	nameErrMsg      = "a valid label key must consist of"
 )
 
 // Ensure custom name functions are allowed
 func TestValidateObjectMetaCustomName(t *testing.T) {
-	errs := ValidateObjectMeta(
-		&metav1.ObjectMeta{Name: "test", GenerateName: "foo"},
-		false,
-		func(s string, prefix bool) []string {
-			if s == "test" {
-				return nil
-			}
-			return []string{"name-gen"}
-		},
-		field.NewPath("field"))
-	if len(errs) != 1 {
-		t.Fatalf("unexpected errors: %v", errs)
+	testCases := []struct {
+		name   string
+		input  metav1.ObjectMeta
+		nErrs  int
+		errStr string
+	}{{
+		name:  "valid name, empty generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: ""},
+	}, {
+		name:  "valid name and generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: "test"},
+	}, {
+		name:   "invalid name, empty generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: ""},
+		nErrs:  1,
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, valid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "test"},
+		nErrs:  1,
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, invalid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "invalid"},
+		nErrs:  2,
+		errStr: "wrong value",
+	}}
+
+	fn := func(s string, prefix bool) []string {
+		// Note: this is called on both name and generateName
+		if s == "test" {
+			return nil
+		}
+		return []string{"wrong value"}
 	}
-	if !strings.Contains(errs[0].Error(), "name-gen") {
-		t.Errorf("unexpected error message: %v", errs)
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateObjectMeta(&tc.input, false, fn, field.NewPath("field"))
+
+			if len(errs) == 0 {
+				if len(tc.errStr) != 0 {
+					t.Fatalf("expected 1 error, got none")
+				}
+			} else {
+				if len(tc.errStr) == 0 {
+					t.Fatalf("expected no errors, got: %v", errs)
+				}
+				if len(errs) != tc.nErrs {
+					t.Fatalf("expected %d errors, got %d: %q", tc.nErrs, len(errs), errs)
+				}
+				if !strings.Contains(errs[0].Error(), "wrong value") {
+					t.Errorf("unexpected error message: %v", errs[0].Error())
+				}
+			}
+		})
+	}
+}
+
+// Ensure custom name functions work
+func TestValidateObjectMetaWithOptsName(t *testing.T) {
+	testCases := []struct {
+		name   string
+		input  metav1.ObjectMeta
+		errStr string
+	}{{
+		name:  "valid name, empty generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: ""},
+	}, {
+		name:  "valid name and generateName",
+		input: metav1.ObjectMeta{Name: "test", GenerateName: "test"},
+	}, {
+		name:   "invalid name, empty generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: ""},
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, valid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "test"},
+		errStr: "wrong value",
+	}, {
+		name:   "invalid name, invalid generateName",
+		input:  metav1.ObjectMeta{Name: "invalid", GenerateName: "invalid"},
+		errStr: "wrong value",
+	}}
+
+	fn := func(fldPath *field.Path, s string) field.ErrorList {
+		if s == "test" {
+			return nil
+		}
+		return field.ErrorList{field.Invalid(fldPath, s, "wrong value")}
+	}
+	for _, tc := range testCases {
+		t.Run(tc.name, func(t *testing.T) {
+			errs := ValidateObjectMetaWithOpts(&tc.input, false, fn, field.NewPath("field"))
+
+			if len(errs) == 0 {
+				if len(tc.errStr) != 0 {
+					t.Fatalf("expected 1 error, got none")
+				}
+			} else {
+				if len(tc.errStr) == 0 {
+					t.Fatalf("expected no errors, got: %v", errs)
+				}
+				if len(errs) != 1 {
+					t.Fatalf("expected 1 error, got %d: %q", len(errs), errs)
+				}
+				if !strings.Contains(errs[0].Error(), "wrong value") {
+					t.Errorf("unexpected error message: %v", errs[0].Error())
+				}
+			}
+		})
 	}
 }
 
 // Ensure namespace names follow dns label format
 func TestValidateObjectMetaNamespaces(t *testing.T) {
-	errs := ValidateObjectMeta(
+	errs := validateObjectMetaAccessorWithOptsCommon(
 		&metav1.ObjectMeta{Name: "test", Namespace: "foo.bar"},
-		true,
-		func(s string, prefix bool) []string {
-			return nil
-		},
-		field.NewPath("field"))
+		true, field.NewPath("field"), nil)
 	if len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -74,13 +165,9 @@ func TestValidateObjectMetaNamespaces(t *testing.T) {
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
 	}
-	errs = ValidateObjectMeta(
+	errs = validateObjectMetaAccessorWithOptsCommon(
 		&metav1.ObjectMeta{Name: "test", Namespace: string(b)},
-		true,
-		func(s string, prefix bool) []string {
-			return nil
-		},
-		field.NewPath("field"))
+		true, field.NewPath("field"), nil)
 	if len(errs) != 2 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
@@ -163,45 +250,41 @@ func TestValidateObjectMetaOwnerReferences(t *testing.T) {
 			ownerReferences: []metav1.OwnerReference{
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind1",
 					Name:       "name",
 					UID:        "1",
 					Controller: &falseVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind2",
 					Name:       "name",
 					UID:        "2",
 					Controller: &trueVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind3",
 					Name:       "name",
 					UID:        "3",
 					Controller: &trueVar,
 				},
 				{
 					APIVersion: "customresourceVersion",
-					Kind:       "customresourceKind",
+					Kind:       "customresourceKind4",
 					Name:       "name",
 					UID:        "4",
 				},
 			},
 			expectError:          true,
-			expectedErrorMessage: "Only one reference can have Controller set to true",
+			expectedErrorMessage: "Only one reference can have Controller set to true. Found \"true\" in references for customresourceKind2/name and customresourceKind3/name",
 		},
 	}
 
 	for _, tc := range testCases {
-		errs := ValidateObjectMeta(
+		errs := validateObjectMetaAccessorWithOptsCommon(
 			&metav1.ObjectMeta{Name: "test", Namespace: "test", OwnerReferences: tc.ownerReferences},
-			true,
-			func(s string, prefix bool) []string {
-				return nil
-			},
-			field.NewPath("field"))
+			true, field.NewPath("field"), nil)
 		if len(errs) != 0 && !tc.expectError {
 			t.Errorf("unexpected error: %v in test case %v", errs, tc.description)
 		}
@@ -219,21 +302,21 @@ func TestValidateObjectMetaUpdateIgnoresCreationTimestamp(t *testing.T) {
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if errs := ValidateObjectMetaUpdate(
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 	if errs := ValidateObjectMetaUpdate(
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(10, 0))},
 		&metav1.ObjectMeta{Name: "test", ResourceVersion: "1", CreationTimestamp: metav1.NewTime(time.Unix(11, 0))},
 		field.NewPath("field"),
-	); len(errs) != 0 {
+	); len(errs) != 1 {
 		t.Fatalf("unexpected errors: %v", errs)
 	}
 }
@@ -288,7 +371,7 @@ func TestValidateFinalizersPreventConflictingFinalizers(t *testing.T) {
 		},
 	}
 	for name, tc := range testcases {
-		errs := ValidateObjectMeta(&tc.ObjectMeta, false, NameIsDNSSubdomain, field.NewPath("field"))
+		errs := validateObjectMetaAccessorWithOptsCommon(&tc.ObjectMeta, false, field.NewPath("field"), nil)
 		if len(errs) == 0 {
 			if len(tc.ExpectedErr) != 0 {
 				t.Errorf("case: %q, expected error to contain %q", name, tc.ExpectedErr)
@@ -328,38 +411,38 @@ func TestValidateObjectMetaUpdatePreventsDeletionFieldMutation(t *testing.T) {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: 1970-01-01 00:16:40 +0000 UTC: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: \"1970-01-01T00:16:40Z\": field is immutable"},
 		},
 		"invalid clear deletionTimestamp": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: null: field is immutable"},
 		},
 		"invalid change deletionTimestamp": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &later},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &now},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionTimestamp: &later},
+			ExpectedErrs: []string{"field.deletionTimestamp: Invalid value: \"1970-01-01T00:33:20Z\": field is immutable"},
 		},
 
 		"invalid set deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
-			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 30: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 30: field is immutable"},
 		},
 		"invalid clear deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
-			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
-			ExpectedErrs: []string{}, // no errors, validation copies the old value
+			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: null: field is immutable"},
 		},
 		"invalid change deletionGracePeriodSeconds": {
 			Old:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodShort},
 			New:          metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodLong},
 			ExpectedNew:  metav1.ObjectMeta{Name: "test", ResourceVersion: "1", DeletionGracePeriodSeconds: &gracePeriodLong},
-			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 40: field is immutable; may only be changed via deletion"},
+			ExpectedErrs: []string{"field.deletionGracePeriodSeconds: Invalid value: 40: field is immutable"},
 		},
 	}
 
@@ -373,7 +456,7 @@ func TestValidateObjectMetaUpdatePreventsDeletionFieldMutation(t *testing.T) {
 		}
 		for i := range errs {
 			if errs[i].Error() != tc.ExpectedErrs[i] {
-				t.Errorf("%s: error #%d: expected %q, got %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
+				t.Errorf("%s: error #%d:\n  expected: %q\n       got: %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
 			}
 		}
 		if !reflect.DeepEqual(tc.New, tc.ExpectedNew) {
@@ -419,14 +502,14 @@ func TestObjectMetaGenerationUpdate(t *testing.T) {
 		}
 		for i := range errList {
 			if errList[i] != tc.ExpectedErrs[i] {
-				t.Errorf("%s: error #%d: expected %q, got %q", k, i, tc.ExpectedErrs[i], errList[i])
+				t.Errorf("%s: error #%d:\n  expected: %q\n       got: %q", k, i, tc.ExpectedErrs[i], errs[i].Error())
 			}
 		}
 	}
 }
 
-// Ensure trailing slash is allowed in generate name
-func TestValidateObjectMetaTrimsTrailingSlash(t *testing.T) {
+// Ensure trailing dash is allowed in generate name
+func TestValidateObjectMetaTrimsTrailingDash(t *testing.T) {
 	errs := ValidateObjectMeta(
 		&metav1.ObjectMeta{Name: "test", GenerateName: "foo-"},
 		false,
@@ -452,10 +535,10 @@ func TestValidateAnnotations(t *testing.T) {
 		{"1234/5678": "bar"},
 		{"1.2.3.4/5678": "bar"},
 		{"UpperCase123": "bar"},
-		{"a": strings.Repeat("b", totalAnnotationSizeLimitB-1)},
+		{"a": strings.Repeat("b", TotalAnnotationSizeLimitB-1)},
 		{
-			"a": strings.Repeat("b", totalAnnotationSizeLimitB/2-1),
-			"c": strings.Repeat("d", totalAnnotationSizeLimitB/2-1),
+			"a": strings.Repeat("b", TotalAnnotationSizeLimitB/2-1),
+			"c": strings.Repeat("d", TotalAnnotationSizeLimitB/2-1),
 		},
 	}
 	for i := range successCases {
@@ -485,10 +568,10 @@ func TestValidateAnnotations(t *testing.T) {
 		}
 	}
 	totalSizeErrorCases := []map[string]string{
-		{"a": strings.Repeat("b", totalAnnotationSizeLimitB)},
+		{"a": strings.Repeat("b", TotalAnnotationSizeLimitB)},
 		{
-			"a": strings.Repeat("b", totalAnnotationSizeLimitB/2),
-			"c": strings.Repeat("d", totalAnnotationSizeLimitB/2),
+			"a": strings.Repeat("b", TotalAnnotationSizeLimitB/2),
+			"c": strings.Repeat("d", TotalAnnotationSizeLimitB/2),
 		},
 	}
 	for i := range totalSizeErrorCases {

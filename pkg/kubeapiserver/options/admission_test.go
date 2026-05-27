@@ -19,13 +19,16 @@ package options
 import (
 	"reflect"
 	"testing"
+
+	"github.com/spf13/pflag"
+	"github.com/stretchr/testify/assert"
 )
 
 func TestValidate(t *testing.T) {
 	// 1. Both `--admission-control` and `--enable-admission-plugins` are specified
 	options := NewAdmissionOptions()
 	options.PluginNames = []string{"ServiceAccount"}
-	options.GenericAdmission.EnablePlugins = []string{"Initializers"}
+	options.GenericAdmission.EnablePlugins = []string{"NodeRestriction"}
 	if len(options.Validate()) == 0 {
 		t.Errorf("Expect error, but got none")
 	}
@@ -33,7 +36,7 @@ func TestValidate(t *testing.T) {
 	// 2. Both `--admission-control` and `--disable-admission-plugins` are specified
 	options = NewAdmissionOptions()
 	options.PluginNames = []string{"ServiceAccount"}
-	options.GenericAdmission.DisablePlugins = []string{"Initializers"}
+	options.GenericAdmission.DisablePlugins = []string{"NodeRestriction"}
 	if len(options.Validate()) == 0 {
 		t.Errorf("Expect error, but got none")
 	}
@@ -50,6 +53,12 @@ func TestValidate(t *testing.T) {
 	options.PluginNames = []string{"ServiceAccount"}
 	if errs := options.Validate(); len(errs) > 0 {
 		t.Errorf("Unexpected err: %v", errs)
+	}
+
+	// nil pointer
+	options = nil
+	if errs := options.Validate(); errs != nil {
+		t.Errorf("expected no errors, error found %+v", errs)
 	}
 }
 
@@ -85,4 +94,23 @@ func TestComputeEnabledAdmission(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAdmissionOptionsAddFlags(t *testing.T) {
+	var args = []string{
+		"--enable-admission-plugins=foo,bar,baz",
+		"--admission-control-config-file=admission_control_config.yaml",
+	}
+
+	opts := NewAdmissionOptions()
+	pf := pflag.NewFlagSet("test-admission-opts", pflag.ContinueOnError)
+	opts.AddFlags(pf)
+
+	if err := pf.Parse(args); err != nil {
+		t.Fatal(err)
+	}
+
+	// using assert because cannot compare neither pointer nor function of underlying GenericAdmission
+	assert.Equal(t, "admission_control_config.yaml", opts.GenericAdmission.ConfigFile)
+	assert.Equal(t, []string{"foo", "bar", "baz"}, opts.GenericAdmission.EnablePlugins)
 }

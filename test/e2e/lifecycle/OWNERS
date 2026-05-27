@@ -1,4 +1,22 @@
+# See the OWNERS docs at https://go.k8s.io/owners
+
 approvers:
-- sig-cluster-lifecycle-maintainers
+  - neolit123
+  - SataQiu
+  - pacoxu
+  - carlory
+  - HirazawaUi
 reviewers:
-- sig-cluster-lifecycle
+  - neolit123
+  - SataQiu
+  - pacoxu
+  - carlory
+  - HirazawaUi
+labels:
+  - sig/cluster-lifecycle
+emeritus_approvers:
+  - fabriziopandini
+  - rosti
+  - ereslibre
+  - timothysc
+  - luxas

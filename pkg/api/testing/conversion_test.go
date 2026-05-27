@@ -17,16 +17,18 @@ limitations under the License.
 package testing
 
 import (
-	"io/ioutil"
 	"math/rand"
+	"os"
 	"testing"
 
+	"github.com/google/go-cmp/cmp"
+
+	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/apitesting/fuzzer"
 	apiequality "k8s.io/apimachinery/pkg/api/equality"
-	"k8s.io/apimachinery/pkg/api/testing/fuzzer"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/util/diff"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/kubernetes/pkg/api/legacyscheme"
-	"k8s.io/kubernetes/pkg/api/testapi"
 	api "k8s.io/kubernetes/pkg/apis/core"
 )
 
@@ -34,7 +36,7 @@ func BenchmarkPodConversion(b *testing.B) {
 	apiObjectFuzzer := fuzzer.FuzzerFor(FuzzerFuncs, rand.NewSource(benchmarkSeed), legacyscheme.Codecs)
 	items := make([]api.Pod, 4)
 	for i := range items {
-		apiObjectFuzzer.Fuzz(&items[i])
+		apiObjectFuzzer.Fill(&items[i])
 		items[i].Spec.InitContainers = nil
 		items[i].Status.InitContainerStatuses = nil
 	}
@@ -46,23 +48,23 @@ func BenchmarkPodConversion(b *testing.B) {
 	scheme := legacyscheme.Scheme
 	for i := 0; i < b.N; i++ {
 		pod := &items[i%width]
-		versionedObj, err := scheme.UnsafeConvertToVersion(pod, legacyscheme.Registry.GroupOrDie(api.GroupName).GroupVersion)
+		versionedObj, err := scheme.UnsafeConvertToVersion(pod, schema.GroupVersion{Group: "", Version: "v1"})
 		if err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}
-		if _, err = scheme.UnsafeConvertToVersion(versionedObj, testapi.Default.InternalGroupVersion()); err != nil {
+		if _, err = scheme.UnsafeConvertToVersion(versionedObj, schema.GroupVersion{Group: "", Version: runtime.APIVersionInternal}); err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}
 	}
 }
 
 func BenchmarkNodeConversion(b *testing.B) {
-	data, err := ioutil.ReadFile("node_example.json")
+	data, err := os.ReadFile("node_example.json")
 	if err != nil {
 		b.Fatalf("Unexpected error while reading file: %v", err)
 	}
 	var node api.Node
-	if err := runtime.DecodeInto(testapi.Default.Codec(), data, &node); err != nil {
+	if err := runtime.DecodeInto(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), data, &node); err != nil {
 		b.Fatalf("Unexpected error decoding node: %v", err)
 	}
 
@@ -70,11 +72,11 @@ func BenchmarkNodeConversion(b *testing.B) {
 	var result *api.Node
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		versionedObj, err := scheme.UnsafeConvertToVersion(&node, legacyscheme.Registry.GroupOrDie(api.GroupName).GroupVersion)
+		versionedObj, err := scheme.UnsafeConvertToVersion(&node, schema.GroupVersion{Group: "", Version: "v1"})
 		if err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}
-		obj, err := scheme.UnsafeConvertToVersion(versionedObj, testapi.Default.InternalGroupVersion())
+		obj, err := scheme.UnsafeConvertToVersion(versionedObj, schema.GroupVersion{Group: "", Version: runtime.APIVersionInternal})
 		if err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}
@@ -82,17 +84,17 @@ func BenchmarkNodeConversion(b *testing.B) {
 	}
 	b.StopTimer()
 	if !apiequality.Semantic.DeepDerivative(node, *result) {
-		b.Fatalf("Incorrect conversion: %s", diff.ObjectDiff(node, *result))
+		b.Fatalf("Incorrect conversion: %s", cmp.Diff(node, *result))
 	}
 }
 
 func BenchmarkReplicationControllerConversion(b *testing.B) {
-	data, err := ioutil.ReadFile("replication_controller_example.json")
+	data, err := os.ReadFile("replication_controller_example.json")
 	if err != nil {
 		b.Fatalf("Unexpected error while reading file: %v", err)
 	}
 	var replicationController api.ReplicationController
-	if err := runtime.DecodeInto(testapi.Default.Codec(), data, &replicationController); err != nil {
+	if err := runtime.DecodeInto(legacyscheme.Codecs.LegacyCodec(v1.SchemeGroupVersion), data, &replicationController); err != nil {
 		b.Fatalf("Unexpected error decoding node: %v", err)
 	}
 
@@ -100,11 +102,11 @@ func BenchmarkReplicationControllerConversion(b *testing.B) {
 	var result *api.ReplicationController
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		versionedObj, err := scheme.UnsafeConvertToVersion(&replicationController, legacyscheme.Registry.GroupOrDie(api.GroupName).GroupVersion)
+		versionedObj, err := scheme.UnsafeConvertToVersion(&replicationController, schema.GroupVersion{Group: "", Version: "v1"})
 		if err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}
-		obj, err := scheme.UnsafeConvertToVersion(versionedObj, testapi.Default.InternalGroupVersion())
+		obj, err := scheme.UnsafeConvertToVersion(versionedObj, schema.GroupVersion{Group: "", Version: runtime.APIVersionInternal})
 		if err != nil {
 			b.Fatalf("Conversion error: %v", err)
 		}

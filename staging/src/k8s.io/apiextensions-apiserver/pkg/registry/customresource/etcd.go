@@ -17,6 +17,7 @@ limitations under the License.
 package customresource
 
 import (
+	"context"
 	"fmt"
 	"strings"
 
@@ -26,10 +27,11 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
+	"k8s.io/apimachinery/pkg/util/managedfields"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
+	"sigs.k8s.io/structured-merge-diff/v6/fieldpath"
 )
 
 // CustomResourceStorage includes dummy storage for CustomResources, and their Status and Scale subresources.
@@ -39,16 +41,44 @@ type CustomResourceStorage struct {
 	Scale          *ScaleREST
 }
 
-func NewStorage(resource schema.GroupResource, listKind schema.GroupVersionKind, strategy customResourceStrategy, optsGetter generic.RESTOptionsGetter, categories []string, tableConvertor rest.TableConvertor) CustomResourceStorage {
-	customResourceREST, customResourceStatusREST := newREST(resource, listKind, strategy, optsGetter, categories, tableConvertor)
-	customResourceRegistry := NewRegistry(customResourceREST)
+func NewStorage(resource schema.GroupResource, singularResource schema.GroupResource, kind, listKind schema.GroupVersionKind, strategy customResourceStrategy, optsGetter generic.RESTOptionsGetter, categories []string, tableConvertor rest.TableConvertor, replicasPathMapping managedfields.ResourcePathMappings) (CustomResourceStorage, error) {
+	var storage CustomResourceStorage
+	store := &genericregistry.Store{
+		NewFunc: func() runtime.Object {
+			// set the expected group/version/kind in the new object as a signal to the versioning decoder
+			ret := &unstructured.Unstructured{}
+			ret.SetGroupVersionKind(kind)
+			return ret
+		},
+		NewListFunc: func() runtime.Object {
+			// lists are never stored, only manufactured, so stomp in the right kind
+			ret := &unstructured.UnstructuredList{}
+			ret.SetGroupVersionKind(listKind)
+			return ret
+		},
+		PredicateFunc:             strategy.MatchCustomResourceDefinitionStorage,
+		DefaultQualifiedResource:  resource,
+		SingularQualifiedResource: singularResource,
 
-	s := CustomResourceStorage{
-		CustomResource: customResourceREST,
+		CreateStrategy:      strategy,
+		UpdateStrategy:      strategy,
+		DeleteStrategy:      strategy,
+		ResetFieldsStrategy: strategy,
+
+		TableConvertor: tableConvertor,
 	}
+	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: strategy.GetAttrs}
+	if err := store.CompleteWithOptions(options); err != nil {
+		return storage, fmt.Errorf("failed to update store with options: %w", err)
+	}
+	storage.CustomResource = &REST{store, categories}
 
 	if strategy.status != nil {
-		s.Status = customResourceStatusREST
+		statusStore := *store
+		statusStrategy := NewStatusStrategy(strategy)
+		statusStore.UpdateStrategy = statusStrategy
+		statusStore.ResetFieldsStrategy = statusStrategy
+		storage.Status = &StatusREST{store: &statusStore}
 	}
 
 	if scale := strategy.scale; scale != nil {
@@ -57,50 +87,23 @@ func NewStorage(resource schema.GroupResource, listKind schema.GroupVersionKind,
 			labelSelectorPath = *scale.LabelSelectorPath
 		}
 
-		s.Scale = &ScaleREST{
-			registry:           customResourceRegistry,
-			specReplicasPath:   scale.SpecReplicasPath,
-			statusReplicasPath: scale.StatusReplicasPath,
-			labelSelectorPath:  labelSelectorPath,
+		storage.Scale = &ScaleREST{
+			store:               store,
+			specReplicasPath:    scale.SpecReplicasPath,
+			statusReplicasPath:  scale.StatusReplicasPath,
+			labelSelectorPath:   labelSelectorPath,
+			parentGV:            kind.GroupVersion(),
+			replicasPathMapping: replicasPathMapping,
 		}
 	}
 
-	return s
+	return storage, nil
 }
 
 // REST implements a RESTStorage for API services against etcd
 type REST struct {
 	*genericregistry.Store
 	categories []string
-}
-
-// newREST returns a RESTStorage object that will work against API services.
-func newREST(resource schema.GroupResource, listKind schema.GroupVersionKind, strategy customResourceStrategy, optsGetter generic.RESTOptionsGetter, categories []string, tableConvertor rest.TableConvertor) (*REST, *StatusREST) {
-	store := &genericregistry.Store{
-		NewFunc: func() runtime.Object { return &unstructured.Unstructured{} },
-		NewListFunc: func() runtime.Object {
-			// lists are never stored, only manufactured, so stomp in the right kind
-			ret := &unstructured.UnstructuredList{}
-			ret.SetGroupVersionKind(listKind)
-			return ret
-		},
-		PredicateFunc:            strategy.MatchCustomResourceDefinitionStorage,
-		DefaultQualifiedResource: resource,
-
-		CreateStrategy: strategy,
-		UpdateStrategy: strategy,
-		DeleteStrategy: strategy,
-
-		TableConvertor: tableConvertor,
-	}
-	options := &generic.StoreOptions{RESTOptions: optsGetter, AttrFunc: strategy.GetAttrs}
-	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
-	}
-
-	statusStore := *store
-	statusStore.UpdateStrategy = NewStatusStrategy(strategy)
-	return &REST{store, categories}, &StatusREST{store: &statusStore}
 }
 
 // Implement CategoriesProvider
@@ -116,25 +119,40 @@ type StatusREST struct {
 	store *genericregistry.Store
 }
 
+var _ = rest.Patcher(&StatusREST{})
+
 func (r *StatusREST) New() runtime.Object {
-	return &unstructured.Unstructured{}
+	return r.store.New()
 }
 
 // Get retrieves the object from the storage. It is required to support Patch.
-func (r *StatusREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	return r.store.Get(ctx, name, options)
+func (r *StatusREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	o, err := r.store.Get(ctx, name, options)
+	if err != nil {
+		return nil, err
+	}
+	return o, nil
 }
 
 // Update alters the status subset of an object.
-func (r *StatusREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc) (runtime.Object, bool, error) {
-	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation)
+func (r *StatusREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	// We are explicitly setting forceAllowCreate to false in the call to the underlying storage because
+	// subresources should never allow create on update.
+	return r.store.Update(ctx, name, objInfo, createValidation, updateValidation, false, options)
+}
+
+// GetResetFields implements rest.ResetFieldsStrategy
+func (r *StatusREST) GetResetFields() map[fieldpath.APIVersion]*fieldpath.Set {
+	return r.store.GetResetFields()
 }
 
 type ScaleREST struct {
-	registry           Registry
-	specReplicasPath   string
-	statusReplicasPath string
-	labelSelectorPath  string
+	store               *genericregistry.Store
+	specReplicasPath    string
+	statusReplicasPath  string
+	labelSelectorPath   string
+	parentGV            schema.GroupVersion
+	replicasPathMapping managedfields.ResourcePathMappings
 }
 
 // ScaleREST implements Patcher
@@ -150,11 +168,12 @@ func (r *ScaleREST) New() runtime.Object {
 	return &autoscalingv1.Scale{}
 }
 
-func (r *ScaleREST) Get(ctx genericapirequest.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
-	cr, err := r.registry.GetCustomResource(ctx, name, options)
+func (r *ScaleREST) Get(ctx context.Context, name string, options *metav1.GetOptions) (runtime.Object, error) {
+	obj, err := r.store.Get(ctx, name, options)
 	if err != nil {
 		return nil, err
 	}
+	cr := obj.(*unstructured.Unstructured)
 
 	scaleObject, replicasFound, err := scaleFromCustomResource(cr, r.specReplicasPath, r.statusReplicasPath, r.labelSelectorPath)
 	if err != nil {
@@ -166,69 +185,78 @@ func (r *ScaleREST) Get(ctx genericapirequest.Context, name string, options *met
 	return scaleObject, err
 }
 
-func (r *ScaleREST) Update(ctx genericapirequest.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc) (runtime.Object, bool, error) {
-	cr, err := r.registry.GetCustomResource(ctx, name, &metav1.GetOptions{})
+func (r *ScaleREST) Update(ctx context.Context, name string, objInfo rest.UpdatedObjectInfo, createValidation rest.ValidateObjectFunc, updateValidation rest.ValidateObjectUpdateFunc, forceAllowCreate bool, options *metav1.UpdateOptions) (runtime.Object, bool, error) {
+	scaleObjInfo := &scaleUpdatedObjectInfo{
+		reqObjInfo:          objInfo,
+		specReplicasPath:    r.specReplicasPath,
+		labelSelectorPath:   r.labelSelectorPath,
+		statusReplicasPath:  r.statusReplicasPath,
+		parentGV:            r.parentGV,
+		replicasPathMapping: r.replicasPathMapping,
+	}
+
+	obj, _, err := r.store.Update(
+		ctx,
+		name,
+		scaleObjInfo,
+		toScaleCreateValidation(createValidation, r.specReplicasPath, r.statusReplicasPath, r.labelSelectorPath),
+		toScaleUpdateValidation(updateValidation, r.specReplicasPath, r.statusReplicasPath, r.labelSelectorPath),
+		false,
+		options,
+	)
 	if err != nil {
 		return nil, false, err
 	}
-
-	const invalidSpecReplicas = -2147483648 // smallest int32
-	oldScale, replicasFound, err := scaleFromCustomResource(cr, r.specReplicasPath, r.statusReplicasPath, r.labelSelectorPath)
-	if err != nil {
-		return nil, false, err
-	}
-	if !replicasFound {
-		oldScale.Spec.Replicas = invalidSpecReplicas // signal that this was not set before
-	}
-
-	obj, err := objInfo.UpdatedObject(ctx, oldScale)
-	if err != nil {
-		return nil, false, err
-	}
-	if obj == nil {
-		return nil, false, apierrors.NewBadRequest(fmt.Sprintf("nil update passed to Scale"))
-	}
-
-	scale, ok := obj.(*autoscalingv1.Scale)
-	if !ok {
-		return nil, false, apierrors.NewBadRequest(fmt.Sprintf("wrong object passed to Scale update: %v", obj))
-	}
-
-	if scale.Spec.Replicas == invalidSpecReplicas {
-		return nil, false, apierrors.NewBadRequest(fmt.Sprintf("the spec replicas field %q cannot be empty", r.specReplicasPath))
-	}
-
-	specReplicasPath := strings.TrimPrefix(r.specReplicasPath, ".") // ignore leading period
-	if err = unstructured.SetNestedField(cr.Object, int64(scale.Spec.Replicas), strings.Split(specReplicasPath, ".")...); err != nil {
-		return nil, false, err
-	}
-	cr.SetResourceVersion(scale.ResourceVersion)
-
-	cr, err = r.registry.UpdateCustomResource(ctx, cr, createValidation, updateValidation)
-	if err != nil {
-		return nil, false, err
-	}
+	cr := obj.(*unstructured.Unstructured)
 
 	newScale, _, err := scaleFromCustomResource(cr, r.specReplicasPath, r.statusReplicasPath, r.labelSelectorPath)
 	if err != nil {
 		return nil, false, apierrors.NewBadRequest(err.Error())
 	}
+
 	return newScale, false, err
+}
+
+func toScaleCreateValidation(f rest.ValidateObjectFunc, specReplicasPath, statusReplicasPath, labelSelectorPath string) rest.ValidateObjectFunc {
+	return func(ctx context.Context, obj runtime.Object) error {
+		scale, _, err := scaleFromCustomResource(obj.(*unstructured.Unstructured), specReplicasPath, statusReplicasPath, labelSelectorPath)
+		if err != nil {
+			return err
+		}
+		return f(ctx, scale)
+	}
+}
+
+func toScaleUpdateValidation(f rest.ValidateObjectUpdateFunc, specReplicasPath, statusReplicasPath, labelSelectorPath string) rest.ValidateObjectUpdateFunc {
+	return func(ctx context.Context, obj, old runtime.Object) error {
+		newScale, _, err := scaleFromCustomResource(obj.(*unstructured.Unstructured), specReplicasPath, statusReplicasPath, labelSelectorPath)
+		if err != nil {
+			return err
+		}
+		oldScale, _, err := scaleFromCustomResource(old.(*unstructured.Unstructured), specReplicasPath, statusReplicasPath, labelSelectorPath)
+		if err != nil {
+			return err
+		}
+		return f(ctx, newScale, oldScale)
+	}
+}
+
+// Split the path per period, ignoring the leading period.
+func splitReplicasPath(replicasPath string) []string {
+	return strings.Split(strings.TrimPrefix(replicasPath, "."), ".")
 }
 
 // scaleFromCustomResource returns a scale subresource for a customresource and a bool signalling wether
 // the specReplicas value was found.
 func scaleFromCustomResource(cr *unstructured.Unstructured, specReplicasPath, statusReplicasPath, labelSelectorPath string) (*autoscalingv1.Scale, bool, error) {
-	specReplicasPath = strings.TrimPrefix(specReplicasPath, ".") // ignore leading period
-	specReplicas, foundSpecReplicas, err := unstructured.NestedInt64(cr.UnstructuredContent(), strings.Split(specReplicasPath, ".")...)
+	specReplicas, foundSpecReplicas, err := unstructured.NestedInt64(cr.UnstructuredContent(), splitReplicasPath(specReplicasPath)...)
 	if err != nil {
 		return nil, false, err
 	} else if !foundSpecReplicas {
 		specReplicas = 0
 	}
 
-	statusReplicasPath = strings.TrimPrefix(statusReplicasPath, ".") // ignore leading period
-	statusReplicas, found, err := unstructured.NestedInt64(cr.UnstructuredContent(), strings.Split(statusReplicasPath, ".")...)
+	statusReplicas, found, err := unstructured.NestedInt64(cr.UnstructuredContent(), splitReplicasPath(statusReplicasPath)...)
 	if err != nil {
 		return nil, false, err
 	} else if !found {
@@ -237,14 +265,18 @@ func scaleFromCustomResource(cr *unstructured.Unstructured, specReplicasPath, st
 
 	var labelSelector string
 	if len(labelSelectorPath) > 0 {
-		labelSelectorPath = strings.TrimPrefix(labelSelectorPath, ".") // ignore leading period
-		labelSelector, found, err = unstructured.NestedString(cr.UnstructuredContent(), strings.Split(labelSelectorPath, ".")...)
+		labelSelector, _, err = unstructured.NestedString(cr.UnstructuredContent(), splitReplicasPath(labelSelectorPath)...)
 		if err != nil {
 			return nil, false, err
 		}
 	}
 
 	scale := &autoscalingv1.Scale{
+		// Populate apiVersion and kind so conversion recognizes we are already in the desired GVK and doesn't try to convert
+		TypeMeta: metav1.TypeMeta{
+			APIVersion: "autoscaling/v1",
+			Kind:       "Scale",
+		},
 		ObjectMeta: metav1.ObjectMeta{
 			Name:              cr.GetName(),
 			Namespace:         cr.GetNamespace(),
@@ -262,4 +294,76 @@ func scaleFromCustomResource(cr *unstructured.Unstructured, specReplicasPath, st
 	}
 
 	return scale, foundSpecReplicas, nil
+}
+
+type scaleUpdatedObjectInfo struct {
+	reqObjInfo          rest.UpdatedObjectInfo
+	specReplicasPath    string
+	statusReplicasPath  string
+	labelSelectorPath   string
+	parentGV            schema.GroupVersion
+	replicasPathMapping managedfields.ResourcePathMappings
+}
+
+func (i *scaleUpdatedObjectInfo) Preconditions() *metav1.Preconditions {
+	return i.reqObjInfo.Preconditions()
+}
+
+func (i *scaleUpdatedObjectInfo) UpdatedObject(ctx context.Context, oldObj runtime.Object) (runtime.Object, error) {
+	cr := oldObj.DeepCopyObject().(*unstructured.Unstructured)
+	const invalidSpecReplicas = -2147483648 // smallest int32
+
+	managedFieldsHandler := managedfields.NewScaleHandler(
+		cr.GetManagedFields(),
+		i.parentGV,
+		i.replicasPathMapping,
+	)
+
+	oldScale, replicasFound, err := scaleFromCustomResource(cr, i.specReplicasPath, i.statusReplicasPath, i.labelSelectorPath)
+	if err != nil {
+		return nil, err
+	}
+	if !replicasFound {
+		oldScale.Spec.Replicas = invalidSpecReplicas // signal that this was not set before
+	}
+
+	scaleManagedFields, err := managedFieldsHandler.ToSubresource()
+	if err != nil {
+		return nil, err
+	}
+	oldScale.ManagedFields = scaleManagedFields
+
+	obj, err := i.reqObjInfo.UpdatedObject(ctx, oldScale)
+	if err != nil {
+		return nil, err
+	}
+	if obj == nil {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("nil update passed to Scale"))
+	}
+
+	scale, ok := obj.(*autoscalingv1.Scale)
+	if !ok {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("wrong object passed to Scale update: %v", obj))
+	}
+
+	if scale.Spec.Replicas == invalidSpecReplicas {
+		return nil, apierrors.NewBadRequest(fmt.Sprintf("the spec replicas field %q cannot be empty", i.specReplicasPath))
+	}
+
+	if err := unstructured.SetNestedField(cr.Object, int64(scale.Spec.Replicas), splitReplicasPath(i.specReplicasPath)...); err != nil {
+		return nil, err
+	}
+	if len(scale.ResourceVersion) != 0 {
+		// The client provided a resourceVersion precondition.
+		// Set that precondition and return any conflict errors to the client.
+		cr.SetResourceVersion(scale.ResourceVersion)
+	}
+
+	updatedEntries, err := managedFieldsHandler.ToParent(scale.ManagedFields)
+	if err != nil {
+		return nil, err
+	}
+	cr.SetManagedFields(updatedEntries)
+
+	return cr, nil
 }

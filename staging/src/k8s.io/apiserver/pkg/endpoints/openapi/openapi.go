@@ -19,18 +19,18 @@ package openapi
 import (
 	"bytes"
 	"fmt"
-	"reflect"
 	"sort"
 	"strings"
 	"unicode"
 
-	restful "github.com/emicklei/go-restful"
-	"github.com/go-openapi/spec"
+	restful "github.com/emicklei/go-restful/v3"
 
-	"k8s.io/apimachinery/pkg/apis/meta/v1"
+	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog/v2"
 	"k8s.io/kube-openapi/pkg/util"
+	"k8s.io/kube-openapi/pkg/validation/spec"
 )
 
 var verbs = util.NewTrie([]string{"get", "log", "read", "replace", "patch", "delete", "deletecollection", "watch", "connect", "proxy", "list", "create", "patch"})
@@ -108,6 +108,18 @@ func (s groupVersionKinds) Less(i, j int) bool {
 	return s[i].Group < s[j].Group
 }
 
+func (s groupVersionKinds) JSON() []interface{} {
+	j := []interface{}{}
+	for _, gvk := range s {
+		j = append(j, map[string]interface{}{
+			"group":   gvk.Group,
+			"version": gvk.Version,
+			"kind":    gvk.Kind,
+		})
+	}
+	return j
+}
+
 // DefinitionNamer is the type to customize OpenAPI definition name.
 type DefinitionNamer struct {
 	typeGroupVersionKinds map[string]groupVersionKinds
@@ -121,34 +133,30 @@ func gvkConvert(gvk schema.GroupVersionKind) v1.GroupVersionKind {
 	}
 }
 
-func friendlyName(name string) string {
-	nameParts := strings.Split(name, "/")
-	// Reverse first part. e.g., io.k8s... instead of k8s.io...
-	if len(nameParts) > 0 && strings.Contains(nameParts[0], ".") {
-		parts := strings.Split(nameParts[0], ".")
-		for i, j := 0, len(parts)-1; i < j; i, j = i+1, j-1 {
-			parts[i], parts[j] = parts[j], parts[i]
-		}
-		nameParts[0] = strings.Join(parts, ".")
-	}
-	return strings.Join(nameParts, ".")
-}
-
-func typeName(t reflect.Type) string {
-	path := t.PkgPath()
-	if strings.Contains(path, "/vendor/") {
-		path = path[strings.Index(path, "/vendor/")+len("/vendor/"):]
-	}
-	return fmt.Sprintf("%s.%s", path, t.Name())
-}
-
 // NewDefinitionNamer constructs a new DefinitionNamer to be used to customize OpenAPI spec.
-func NewDefinitionNamer(s *runtime.Scheme) DefinitionNamer {
-	ret := DefinitionNamer{
+func NewDefinitionNamer(schemes ...*runtime.Scheme) *DefinitionNamer {
+	ret := &DefinitionNamer{
 		typeGroupVersionKinds: map[string]groupVersionKinds{},
 	}
-	for gvk, rtype := range s.AllKnownTypes() {
-		ret.typeGroupVersionKinds[typeName(rtype)] = append(ret.typeGroupVersionKinds[typeName(rtype)], gvkConvert(gvk))
+	for _, s := range schemes {
+		for gvk := range s.AllKnownTypes() {
+			newGVK := gvkConvert(gvk)
+			exists := false
+			name, err := s.ToOpenAPIDefinitionName(gvk)
+			if err != nil {
+				klog.Fatalf("failed to get OpenAPI definition name for %v: %v", gvk, err)
+				continue
+			}
+			for _, existingGVK := range ret.typeGroupVersionKinds[name] {
+				if newGVK == existingGVK {
+					exists = true
+					break
+				}
+			}
+			if !exists {
+				ret.typeGroupVersionKinds[name] = append(ret.typeGroupVersionKinds[name], newGVK)
+			}
+		}
 	}
 	for _, gvk := range ret.typeGroupVersionKinds {
 		sort.Sort(gvk)
@@ -159,9 +167,9 @@ func NewDefinitionNamer(s *runtime.Scheme) DefinitionNamer {
 // GetDefinitionName returns the name and tags for a given definition
 func (d *DefinitionNamer) GetDefinitionName(name string) (string, spec.Extensions) {
 	if groupVersionKinds, ok := d.typeGroupVersionKinds[name]; ok {
-		return friendlyName(name), spec.Extensions{
-			extensionGVK: []v1.GroupVersionKind(groupVersionKinds),
+		return name, spec.Extensions{
+			extensionGVK: groupVersionKinds.JSON(),
 		}
 	}
-	return friendlyName(name), nil
+	return name, nil
 }

@@ -17,6 +17,7 @@ limitations under the License.
 package union
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"reflect"
@@ -24,6 +25,7 @@ import (
 
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
+	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
 )
 
 type mockAuthzHandler struct {
@@ -31,8 +33,18 @@ type mockAuthzHandler struct {
 	err      error
 }
 
-func (mock *mockAuthzHandler) Authorize(a authorizer.Attributes) (authorizer.Decision, string, error) {
+func (mock *mockAuthzHandler) Authorize(ctx context.Context, a authorizer.Attributes) (authorizer.Decision, string, error) {
 	return mock.decision, "", mock.err
+}
+
+// ConditionsAwareAuthorize is not conditions-aware, converts the Authorize decision.
+func (mock *mockAuthzHandler) ConditionsAwareAuthorize(ctx context.Context, a authorizer.Attributes) authorizer.ConditionsAwareDecision {
+	return authorizer.ConditionsAwareDecisionFromParts(mock.Authorize(ctx, a))
+}
+
+// EvaluateConditions is not supported by this authorizer.
+func (*mockAuthzHandler) EvaluateConditions(_ context.Context, _ authorizer.ConditionsAwareDecision, _ authorizer.ConditionsData) (authorizer.Decision, string, error) {
+	return authorizer.DecisionDeny, "", authorizer.ErrorConditionEvaluationNotSupported
 }
 
 func TestAuthorizationSecondPasses(t *testing.T) {
@@ -40,7 +52,7 @@ func TestAuthorizationSecondPasses(t *testing.T) {
 	handler2 := &mockAuthzHandler{decision: authorizer.DecisionAllow}
 	authzHandler := New(handler1, handler2)
 
-	authorized, _, _ := authzHandler.Authorize(nil)
+	authorized, _, _ := authzHandler.Authorize(context.Background(), nil)
 	if authorized != authorizer.DecisionAllow {
 		t.Errorf("Unexpected authorization failure")
 	}
@@ -51,7 +63,7 @@ func TestAuthorizationFirstPasses(t *testing.T) {
 	handler2 := &mockAuthzHandler{decision: authorizer.DecisionNoOpinion}
 	authzHandler := New(handler1, handler2)
 
-	authorized, _, _ := authzHandler.Authorize(nil)
+	authorized, _, _ := authzHandler.Authorize(context.Background(), nil)
 	if authorized != authorizer.DecisionAllow {
 		t.Errorf("Unexpected authorization failure")
 	}
@@ -62,7 +74,7 @@ func TestAuthorizationNonePasses(t *testing.T) {
 	handler2 := &mockAuthzHandler{decision: authorizer.DecisionNoOpinion}
 	authzHandler := New(handler1, handler2)
 
-	authorized, _, _ := authzHandler.Authorize(nil)
+	authorized, _, _ := authzHandler.Authorize(context.Background(), nil)
 	if authorized == authorizer.DecisionAllow {
 		t.Errorf("Expected failed authorization")
 	}
@@ -73,7 +85,7 @@ func TestAuthorizationError(t *testing.T) {
 	handler2 := &mockAuthzHandler{err: fmt.Errorf("foo")}
 	authzHandler := New(handler1, handler2)
 
-	_, _, err := authzHandler.Authorize(nil)
+	_, _, err := authzHandler.Authorize(context.Background(), nil)
 	if err == nil {
 		t.Errorf("Expected error: %v", err)
 	}
@@ -85,7 +97,7 @@ type mockAuthzRuleHandler struct {
 	err              error
 }
 
-func (mock *mockAuthzRuleHandler) RulesFor(user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
+func (mock *mockAuthzRuleHandler) RulesFor(ctx context.Context, user user.Info, namespace string) ([]authorizer.ResourceRuleInfo, []authorizer.NonResourceRuleInfo, bool, error) {
 	if mock.err != nil {
 		return []authorizer.ResourceRuleInfo{}, []authorizer.NonResourceRuleInfo{}, false, mock.err
 	}
@@ -149,7 +161,7 @@ func TestAuthorizationResourceRules(t *testing.T) {
 
 	authzRulesHandler := NewRuleResolvers(handler1, handler2)
 
-	rules, _, _, _ := authzRulesHandler.RulesFor(nil, "")
+	rules, _, _, _ := authzRulesHandler.RulesFor(genericapirequest.NewContext(), nil, "")
 	actual := getResourceRules(rules)
 	if !reflect.DeepEqual(expected, actual) {
 		t.Errorf("Expected: \n%#v\n but actual: \n%#v\n", expected, actual)
@@ -188,7 +200,7 @@ func TestAuthorizationNonResourceRules(t *testing.T) {
 
 	authzRulesHandler := NewRuleResolvers(handler1, handler2)
 
-	_, rules, _, _ := authzRulesHandler.RulesFor(nil, "")
+	_, rules, _, _ := authzRulesHandler.RulesFor(genericapirequest.NewContext(), nil, "")
 	actual := getNonResourceRules(rules)
 	if !reflect.DeepEqual(expected, actual) {
 		t.Errorf("Expected: \n%#v\n but actual: \n%#v\n", expected, actual)
@@ -257,7 +269,7 @@ func TestAuthorizationUnequivocalDeny(t *testing.T) {
 		t.Run(fmt.Sprintf("case %v", i), func(t *testing.T) {
 			authzHandler := New(c.authorizers...)
 
-			decision, _, _ := authzHandler.Authorize(nil)
+			decision, _, _ := authzHandler.Authorize(context.Background(), nil)
 			if decision != c.decision {
 				t.Errorf("Unexpected authorization failure: %v, expected: %v", decision, c.decision)
 			}

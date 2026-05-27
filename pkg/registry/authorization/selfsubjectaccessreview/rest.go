@@ -17,9 +17,11 @@ limitations under the License.
 package selfsubjectaccessreview
 
 import (
+	"context"
 	"fmt"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -30,18 +32,34 @@ import (
 )
 
 type REST struct {
-	authorizer authorizer.Authorizer
+	authorizer authorizer.UnconditionalAuthorizer
 }
 
-func NewREST(authorizer authorizer.Authorizer) *REST {
+func NewREST(authorizer authorizer.UnconditionalAuthorizer) *REST {
 	return &REST{authorizer}
+}
+
+func (r *REST) NamespaceScoped() bool {
+	return false
 }
 
 func (r *REST) New() runtime.Object {
 	return &authorizationapi.SelfSubjectAccessReview{}
 }
 
-func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, includeUninitialized bool) (runtime.Object, error) {
+// Destroy cleans up resources on shutdown.
+func (r *REST) Destroy() {
+	// Given no underlying store, we don't destroy anything
+	// here explicitly.
+}
+
+var _ rest.SingularNameProvider = &REST{}
+
+func (r *REST) GetSingularName() string {
+	return "selfsubjectaccessreview"
+}
+
+func (r *REST) Create(ctx context.Context, obj runtime.Object, createValidation rest.ValidateObjectFunc, options *metav1.CreateOptions) (runtime.Object, error) {
 	selfSAR, ok := obj.(*authorizationapi.SelfSubjectAccessReview)
 	if !ok {
 		return nil, apierrors.NewBadRequest(fmt.Sprintf("not a SelfSubjectAccessReview: %#v", obj))
@@ -54,6 +72,12 @@ func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createV
 		return nil, apierrors.NewBadRequest("no user present on request")
 	}
 
+	if createValidation != nil {
+		if err := createValidation(ctx, obj.DeepCopyObject()); err != nil {
+			return nil, err
+		}
+	}
+
 	var authorizationAttributes authorizer.AttributesRecord
 	if selfSAR.Spec.ResourceAttributes != nil {
 		authorizationAttributes = authorizationutil.ResourceAttributesFrom(userToCheck, *selfSAR.Spec.ResourceAttributes)
@@ -61,16 +85,14 @@ func (r *REST) Create(ctx genericapirequest.Context, obj runtime.Object, createV
 		authorizationAttributes = authorizationutil.NonResourceAttributesFrom(userToCheck, *selfSAR.Spec.NonResourceAttributes)
 	}
 
-	decision, reason, evaluationErr := r.authorizer.Authorize(authorizationAttributes)
+	decision, reason, evaluationErr := r.authorizer.Authorize(ctx, authorizationAttributes)
 
 	selfSAR.Status = authorizationapi.SubjectAccessReviewStatus{
 		Allowed: (decision == authorizer.DecisionAllow),
 		Denied:  (decision == authorizer.DecisionDeny),
 		Reason:  reason,
 	}
-	if evaluationErr != nil {
-		selfSAR.Status.EvaluationError = evaluationErr.Error()
-	}
+	selfSAR.Status.EvaluationError = authorizationutil.BuildEvaluationError(evaluationErr, authorizationAttributes)
 
 	return selfSAR, nil
 }

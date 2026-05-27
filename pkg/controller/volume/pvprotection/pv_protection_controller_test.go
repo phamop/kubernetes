@@ -17,15 +17,13 @@ limitations under the License.
 package pvprotection
 
 import (
+	"context"
 	"errors"
 	"reflect"
 	"testing"
 	"time"
 
-	"github.com/davecgh/go-spew/spew"
-	"github.com/golang/glog"
-
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -34,8 +32,10 @@ import (
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
 	clienttesting "k8s.io/client-go/testing"
+	"k8s.io/klog/v2/ktesting"
 	"k8s.io/kubernetes/pkg/controller"
 	volumeutil "k8s.io/kubernetes/pkg/volume/util"
+	"k8s.io/utils/dump"
 )
 
 const defaultPVName = "default-pv"
@@ -107,7 +107,7 @@ func TestPVProtectionController(t *testing.T) {
 		// Optional client reactors.
 		reactors []reaction
 		// PV event to simulate. This PV will be automatically added to
-		// initalObjects.
+		// initialObjects.
 		updatedPV *v1.PersistentVolume
 		// List of expected kubeclient actions that should happen during the
 		// test.
@@ -199,7 +199,7 @@ func TestPVProtectionController(t *testing.T) {
 			case *v1.PersistentVolume:
 				pvInformer.Informer().GetStore().Add(obj)
 			default:
-				t.Fatalf("Unknown initalObject type: %+v", obj)
+				t.Fatalf("Unknown initialObject type: %+v", obj)
 			}
 		}
 
@@ -209,11 +209,12 @@ func TestPVProtectionController(t *testing.T) {
 		}
 
 		// Create the controller
-		ctrl := NewPVProtectionController(pvInformer, client)
+		logger, _ := ktesting.NewTestContext(t)
+		ctrl := NewPVProtectionController(logger, pvInformer, client)
 
 		// Start the test by simulating an event
 		if test.updatedPV != nil {
-			ctrl.pvAddedUpdated(test.updatedPV)
+			ctrl.pvAddedUpdated(logger, test.updatedPV)
 		}
 
 		// Process the controller queue until we get expected results
@@ -225,8 +226,8 @@ func TestPVProtectionController(t *testing.T) {
 				break
 			}
 			if ctrl.queue.Len() > 0 {
-				glog.V(5).Infof("Test %q: %d events queue, processing one", test.name, ctrl.queue.Len())
-				ctrl.processNextWorkItem()
+				logger.V(5).Info("Non-empty events queue, processing one", "test", test.name, "queueLength", ctrl.queue.Len())
+				ctrl.processNextWorkItem(context.TODO())
 			}
 			if ctrl.queue.Len() > 0 {
 				// There is still some work in the queue, process it now
@@ -236,7 +237,7 @@ func TestPVProtectionController(t *testing.T) {
 			if currentActionCount < len(test.expectedActions) {
 				// Do not log evey wait, only when the action count changes.
 				if lastReportedActionCount < currentActionCount {
-					glog.V(5).Infof("Test %q: got %d actions out of %d, waiting for the rest", test.name, currentActionCount, len(test.expectedActions))
+					logger.V(5).Info("Waiting for the remaining actions", "test", test.name, "currentActionCount", currentActionCount, "expectedActionCount", len(test.expectedActions))
 					lastReportedActionCount = currentActionCount
 				}
 				// The test expected more to happen, wait for the actions.
@@ -249,7 +250,7 @@ func TestPVProtectionController(t *testing.T) {
 		actions := client.Actions()
 
 		if !reflect.DeepEqual(actions, test.expectedActions) {
-			t.Errorf("Test %q: action not expected\nExpected:\n%s\ngot:\n%s", test.name, spew.Sdump(test.expectedActions), spew.Sdump(actions))
+			t.Errorf("Test %q: action not expected\nExpected:\n%s\ngot:\n%s", test.name, dump.Pretty(test.expectedActions), dump.Pretty(actions))
 		}
 
 	}

@@ -18,108 +18,108 @@ limitations under the License.
 package envelope
 
 import (
+	"context"
 	"fmt"
 	"net"
-	"net/url"
+	"sync"
 	"time"
 
-	"github.com/golang/glog"
-
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 
-	"golang.org/x/net/context"
-
-	kmsapi "k8s.io/apiserver/pkg/storage/value/encrypt/envelope/v1beta1"
+	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2"
+	kmsapi "k8s.io/kms/apis/v1beta1"
+	"k8s.io/kms/pkg/util"
 )
 
 const (
-	// Now only supported unix domain socket.
+	// unixProtocol is the only supported protocol for remote KMS provider.
 	unixProtocol = "unix"
-
 	// Current version for the protocol interface definition.
 	kmsapiVersion = "v1beta1"
 
-	// The timeout that communicate with KMS server.
-	timeout = 30 * time.Second
+	versionErrorf = "KMS provider api version %s is not supported, only %s is supported now"
 )
 
 // The gRPC implementation for envelope.Service.
 type gRPCService struct {
-	// gRPC client instance
-	kmsClient  kmsapi.KeyManagementServiceClient
-	connection *grpc.ClientConn
+	kmsClient      kmsapi.KeyManagementServiceClient
+	connection     *grpc.ClientConn
+	callTimeout    time.Duration
+	mux            sync.RWMutex
+	versionChecked bool
 }
 
 // NewGRPCService returns an envelope.Service which use gRPC to communicate the remote KMS provider.
-func NewGRPCService(endpoint string) (Service, error) {
-	glog.V(4).Infof("Configure KMS provider with endpoint: %s", endpoint)
+func NewGRPCService(ctx context.Context, endpoint string, callTimeout time.Duration) (Service, error) {
+	klog.V(4).InfoS("Configure KMS provider", "endpoint", endpoint)
 
-	addr, err := parseEndpoint(endpoint)
+	addr, err := util.ParseEndpoint(endpoint)
 	if err != nil {
 		return nil, err
 	}
 
-	connection, err := grpc.Dial(addr, grpc.WithInsecure(), grpc.WithTimeout(timeout), grpc.WithDialer(unixDial))
+	s := &gRPCService{callTimeout: callTimeout}
+	s.connection, err = grpc.Dial(
+		addr,
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithUnaryInterceptor(s.interceptor),
+		grpc.WithDefaultCallOptions(grpc.WaitForReady(true)),
+		grpc.WithContextDialer(
+			func(context.Context, string) (net.Conn, error) {
+				// Ignoring addr and timeout arguments:
+				// addr - comes from the closure
+				c, err := net.DialUnix(unixProtocol, nil, &net.UnixAddr{Name: addr})
+				if err != nil {
+					klog.ErrorS(err, "failed to create connection to unix socket", "addr", addr)
+				} else {
+					klog.V(4).InfoS("Successfully dialed Unix socket", "addr", addr)
+				}
+				return c, err
+			}))
+
 	if err != nil {
-		return nil, fmt.Errorf("connect remote KMS provider %q failed, error: %v", addr, err)
+		return nil, fmt.Errorf("failed to create connection to %s, error: %v", endpoint, err)
 	}
 
-	kmsClient := kmsapi.NewKeyManagementServiceClient(connection)
+	s.kmsClient = kmsapi.NewKeyManagementServiceClient(s.connection)
 
-	err = checkAPIVersion(kmsClient)
-	if err != nil {
-		connection.Close()
-		return nil, fmt.Errorf("failed check version for %q, error: %v", addr, err)
-	}
+	go func() {
+		defer utilruntime.HandleCrashWithContext(ctx)
 
-	return &gRPCService{kmsClient: kmsClient, connection: connection}, nil
+		<-ctx.Done()
+		_ = s.connection.Close()
+	}()
+
+	return s, nil
 }
 
-// This dialer explicitly ask gRPC to use unix socket as network.
-func unixDial(addr string, timeout time.Duration) (net.Conn, error) {
-	return net.DialTimeout(unixProtocol, addr, timeout)
-}
+func (g *gRPCService) checkAPIVersion(ctx context.Context) error {
+	g.mux.Lock()
+	defer g.mux.Unlock()
 
-// Parse the endpoint to extract schema, host or path.
-func parseEndpoint(endpoint string) (string, error) {
-	if len(endpoint) == 0 {
-		return "", fmt.Errorf("remote KMS provider can't use empty string as endpoint")
+	if g.versionChecked {
+		return nil
 	}
-
-	u, err := url.Parse(endpoint)
-	if err != nil {
-		return "", fmt.Errorf("invalid endpoint %q for remote KMS provider, error: %v", endpoint, err)
-	}
-
-	if u.Scheme != unixProtocol {
-		return "", fmt.Errorf("unsupported scheme %q for remote KMS provider", u.Scheme)
-	}
-	return u.Path, nil
-}
-
-// Check the KMS provider API version.
-// Only matching kmsapiVersion is supported now.
-func checkAPIVersion(kmsClient kmsapi.KeyManagementServiceClient) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
-	defer cancel()
 
 	request := &kmsapi.VersionRequest{Version: kmsapiVersion}
-	response, err := kmsClient.Version(ctx, request)
+	response, err := g.kmsClient.Version(ctx, request)
 	if err != nil {
 		return fmt.Errorf("failed get version from remote KMS provider: %v", err)
 	}
 	if response.Version != kmsapiVersion {
-		return fmt.Errorf("KMS provider api version %s is not supported, only %s is supported now",
-			response.Version, kmsapiVersion)
+		return fmt.Errorf(versionErrorf, response.Version, kmsapiVersion)
 	}
+	g.versionChecked = true
 
-	glog.V(4).Infof("KMS provider %s initialized, version: %s", response.RuntimeName, response.RuntimeVersion)
+	klog.V(4).InfoS("KMS provider api version verified", "version", response.Version)
 	return nil
 }
 
 // Decrypt a given data string to obtain the original byte data.
 func (g *gRPCService) Decrypt(cipher []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), g.callTimeout)
 	defer cancel()
 
 	request := &kmsapi.DecryptRequest{Cipher: cipher, Version: kmsapiVersion}
@@ -132,7 +132,7 @@ func (g *gRPCService) Decrypt(cipher []byte) ([]byte, error) {
 
 // Encrypt bytes to a string ciphertext.
 func (g *gRPCService) Encrypt(plain []byte) ([]byte, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	ctx, cancel := context.WithTimeout(context.Background(), g.callTimeout)
 	defer cancel()
 
 	request := &kmsapi.EncryptRequest{Plain: plain, Version: kmsapiVersion}
@@ -141,4 +141,22 @@ func (g *gRPCService) Encrypt(plain []byte) ([]byte, error) {
 		return nil, err
 	}
 	return response.Cipher, nil
+}
+
+func (g *gRPCService) interceptor(
+	ctx context.Context,
+	method string,
+	req interface{},
+	reply interface{},
+	cc *grpc.ClientConn,
+	invoker grpc.UnaryInvoker,
+	opts ...grpc.CallOption,
+) error {
+	if !kmsapi.IsVersionCheckMethod(method) {
+		if err := g.checkAPIVersion(ctx); err != nil {
+			return err
+		}
+	}
+
+	return invoker(ctx, method, req, reply, cc, opts...)
 }

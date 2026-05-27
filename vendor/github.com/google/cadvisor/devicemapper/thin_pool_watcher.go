@@ -11,24 +11,41 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
+
 package devicemapper
 
 import (
 	"fmt"
 	"strings"
-	"sync"
+	"sync/atomic"
 	"time"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
 )
+
+// usageCache is a typed wrapper around atomic.Value that eliminates the need
+// for type assertions at every call site. It stores device ID strings mapped
+// to usage values (uint64).
+type usageCache struct {
+	v atomic.Value
+}
+
+// Load retrieves the current cache map.
+func (c *usageCache) Load() map[string]uint64 {
+	return c.v.Load().(map[string]uint64)
+}
+
+// Store saves a new cache map.
+func (c *usageCache) Store(m map[string]uint64) {
+	c.v.Store(m)
+}
 
 // ThinPoolWatcher maintains a cache of device name -> usage stats for a
 // devicemapper thin-pool using thin_ls.
 type ThinPoolWatcher struct {
 	poolName       string
 	metadataDevice string
-	lock           *sync.RWMutex
-	cache          map[string]uint64
+	cache          usageCache
 	period         time.Duration
 	stopChan       chan struct{}
 	dmsetup        DmsetupClient
@@ -43,22 +60,23 @@ func NewThinPoolWatcher(poolName, metadataDevice string) (*ThinPoolWatcher, erro
 		return nil, fmt.Errorf("encountered error creating thin_ls client: %v", err)
 	}
 
-	return &ThinPoolWatcher{poolName: poolName,
+	w := &ThinPoolWatcher{
+		poolName:       poolName,
 		metadataDevice: metadataDevice,
-		lock:           &sync.RWMutex{},
-		cache:          make(map[string]uint64),
 		period:         15 * time.Second,
 		stopChan:       make(chan struct{}),
 		dmsetup:        NewDmsetupClient(),
 		thinLsClient:   thinLsClient,
-	}, nil
+	}
+	w.cache.Store(map[string]uint64{})
+	return w, nil
 }
 
 // Start starts the ThinPoolWatcher.
 func (w *ThinPoolWatcher) Start() {
 	err := w.Refresh()
 	if err != nil {
-		glog.Errorf("encountered error refreshing thin pool watcher: %v", err)
+		klog.Errorf("encountered error refreshing thin pool watcher: %v", err)
 	}
 
 	for {
@@ -69,12 +87,12 @@ func (w *ThinPoolWatcher) Start() {
 			start := time.Now()
 			err = w.Refresh()
 			if err != nil {
-				glog.Errorf("encountered error refreshing thin pool watcher: %v", err)
+				klog.Errorf("encountered error refreshing thin pool watcher: %v", err)
 			}
 
 			// print latency for refresh
 			duration := time.Since(start)
-			glog.V(5).Infof("thin_ls(%d) took %s", start.Unix(), duration)
+			klog.V(5).Infof("thin_ls(%d) took %s", start.Unix(), duration)
 		}
 	}
 }
@@ -85,15 +103,12 @@ func (w *ThinPoolWatcher) Stop() {
 }
 
 // GetUsage gets the cached usage value of the given device.
-func (w *ThinPoolWatcher) GetUsage(deviceId string) (uint64, error) {
-	w.lock.RLock()
-	defer w.lock.RUnlock()
-
-	v, ok := w.cache[deviceId]
+func (w *ThinPoolWatcher) GetUsage(deviceID string) (uint64, error) {
+	cache := w.cache.Load()
+	v, ok := cache[deviceID]
 	if !ok {
-		return 0, fmt.Errorf("no cached value for usage of device %v", deviceId)
+		return 0, fmt.Errorf("no cached value for usage of device %v", deviceID)
 	}
-
 	return v, nil
 }
 
@@ -105,9 +120,6 @@ const (
 // Refresh performs a `thin_ls` of the pool being watched and refreshes the
 // cached data with the result.
 func (w *ThinPoolWatcher) Refresh() error {
-	w.lock.Lock()
-	defer w.lock.Unlock()
-
 	currentlyReserved, err := w.checkReservation(w.poolName)
 	if err != nil {
 		err = fmt.Errorf("error determining whether snapshot is reserved: %v", err)
@@ -115,7 +127,7 @@ func (w *ThinPoolWatcher) Refresh() error {
 	}
 
 	if currentlyReserved {
-		glog.V(5).Infof("metadata for %v is currently reserved; releasing", w.poolName)
+		klog.V(5).Infof("metadata for %v is currently reserved; releasing", w.poolName)
 		_, err = w.dmsetup.Message(w.poolName, 0, releaseMetadataMessage)
 		if err != nil {
 			err = fmt.Errorf("error releasing metadata snapshot for %v: %v", w.poolName, err)
@@ -123,29 +135,31 @@ func (w *ThinPoolWatcher) Refresh() error {
 		}
 	}
 
-	glog.V(5).Infof("reserving metadata snapshot for thin-pool %v", w.poolName)
+	klog.V(5).Infof("reserving metadata snapshot for thin-pool %v", w.poolName)
 	// NOTE: "0" in the call below is for the 'sector' argument to 'dmsetup
 	// message'.  It's not needed for thin pools.
 	if output, err := w.dmsetup.Message(w.poolName, 0, reserveMetadataMessage); err != nil {
 		err = fmt.Errorf("error reserving metadata for thin-pool %v: %v output: %v", w.poolName, err, string(output))
 		return err
-	} else {
-		glog.V(5).Infof("reserved metadata snapshot for thin-pool %v", w.poolName)
 	}
+	klog.V(5).Infof("reserved metadata snapshot for thin-pool %v", w.poolName)
 
 	defer func() {
-		glog.V(5).Infof("releasing metadata snapshot for thin-pool %v", w.poolName)
-		w.dmsetup.Message(w.poolName, 0, releaseMetadataMessage)
+		klog.V(5).Infof("releasing metadata snapshot for thin-pool %v", w.poolName)
+		_, err := w.dmsetup.Message(w.poolName, 0, releaseMetadataMessage)
+		if err != nil {
+			klog.Warningf("Unable to release metadata snapshot for thin-pool %v: %s", w.poolName, err)
+		}
 	}()
 
-	glog.V(5).Infof("running thin_ls on metadata device %v", w.metadataDevice)
+	klog.V(5).Infof("running thin_ls on metadata device %v", w.metadataDevice)
 	newCache, err := w.thinLsClient.ThinLs(w.metadataDevice)
 	if err != nil {
 		err = fmt.Errorf("error performing thin_ls on metadata device %v: %v", w.metadataDevice, err)
 		return err
 	}
 
-	w.cache = newCache
+	w.cache.Store(newCache)
 	return nil
 }
 
@@ -157,7 +171,7 @@ const (
 // checkReservation checks to see whether the thin device is currently holding
 // userspace metadata.
 func (w *ThinPoolWatcher) checkReservation(poolName string) (bool, error) {
-	glog.V(5).Infof("checking whether the thin-pool is holding a metadata snapshot")
+	klog.V(5).Infof("checking whether the thin-pool is holding a metadata snapshot")
 	output, err := w.dmsetup.Status(poolName)
 	if err != nil {
 		return false, err

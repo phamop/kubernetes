@@ -28,14 +28,14 @@ func GetResourceUtilizationRatio(metrics PodMetricsInfo, requests map[string]int
 	requestsTotal := int64(0)
 	numEntries := 0
 
-	for podName, metricValue := range metrics {
+	for podName, metric := range metrics {
 		request, hasRequest := requests[podName]
 		if !hasRequest {
 			// we check for missing requests elsewhere, so assuming missing requests == extraneous metrics
 			continue
 		}
 
-		metricsTotal += metricValue
+		metricsTotal += metric.Value
 		requestsTotal += request
 		numEntries++
 	}
@@ -51,16 +51,16 @@ func GetResourceUtilizationRatio(metrics PodMetricsInfo, requests map[string]int
 	return float64(currentUtilization) / float64(targetUtilization), currentUtilization, metricsTotal / int64(numEntries), nil
 }
 
-// GetMetricUtilizationRatio takes in a set of metrics and a target utilization value,
-// and calcuates the ratio of desired to actual utilization
-// (returning that and the actual utilization)
-func GetMetricUtilizationRatio(metrics PodMetricsInfo, targetUtilization int64) (utilizationRatio float64, currentUtilization int64) {
+// GetMetricUsageRatio takes in a set of metrics and a target usage value,
+// and calculates the ratio of desired to actual usage
+// (returning that and the actual usage)
+func GetMetricUsageRatio(metrics PodMetricsInfo, targetUsage int64) (usageRatio float64, currentUsage int64) {
 	metricsTotal := int64(0)
-	for _, metricValue := range metrics {
-		metricsTotal += metricValue
+	for _, metric := range metrics {
+		metricsTotal += metric.Value
 	}
 
-	currentUtilization = metricsTotal / int64(len(metrics))
+	currentUsage = metricsTotal / int64(len(metrics))
 
-	return float64(currentUtilization) / float64(targetUtilization), currentUtilization
+	return float64(currentUsage) / float64(targetUsage), currentUsage
 }

@@ -25,6 +25,9 @@ const (
 	// ImpersonateUserHeader is used to impersonate a particular user during an API server request
 	ImpersonateUserHeader = "Impersonate-User"
 
+	// ImpersonateUIDHeader is used to impersonate a particular UID during an API server request.
+	ImpersonateUIDHeader = "Impersonate-Uid"
+
 	// ImpersonateGroupHeader is used to impersonate a particular group during an API server request.
 	// It can be repeated multiplied times for multiple groups.
 	ImpersonateGroupHeader = "Impersonate-Group"
@@ -36,9 +39,6 @@ const (
 	ImpersonateUserExtraHeaderPrefix = "Impersonate-Extra-"
 )
 
-// +genclient
-// +genclient:nonNamespaced
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // TokenReview attempts to authenticate a token to a known user.
@@ -58,7 +58,13 @@ type TokenReview struct {
 // TokenReviewSpec is a description of the token authentication request.
 type TokenReviewSpec struct {
 	// Token is the opaque bearer token.
-	Token string
+	Token string `datapolicy:"token"`
+	// Audiences is a list of the identifiers that the resource server presented
+	// with the token identifies as. Audience-aware token authenticators will
+	// verify that the token was intended for at least one of the audiences in
+	// this list. If no audiences are provided, the audience will default to the
+	// audience of the Kubernetes apiserver.
+	Audiences []string
 }
 
 // TokenReviewStatus is the result of the token authentication request.
@@ -68,6 +74,16 @@ type TokenReviewStatus struct {
 	Authenticated bool
 	// User is the UserInfo associated with the provided token.
 	User UserInfo
+	// Audiences are audience identifiers chosen by the authenticator that are
+	// compatible with both the TokenReview and token. An identifier is any
+	// identifier in the intersection of the TokenReviewSpec audiences and the
+	// token's audiences. A client of the TokenReview API that sets the
+	// spec.audiences field should validate that a compatible audience identifier
+	// is returned in the status.audiences field to ensure that the TokenReview
+	// server is audience aware. If a TokenReview returns an empty
+	// status.audience field where status.authenticated is "true", the token is
+	// valid against the audience of the Kubernetes API server.
+	Audiences []string
 	// Error indicates that the token couldn't be checked
 	Error string
 }
@@ -105,8 +121,8 @@ type TokenRequest struct {
 
 // TokenRequestSpec contains client provided parameters of a token request.
 type TokenRequestSpec struct {
-	// Audiences are the intendend audiences of the token. A recipient of a
-	// token must identitfy themself with an identifier in the list of
+	// Audiences are the intended audiences of the token. A recipient of a
+	// token must identify themself with an identifier in the list of
 	// audiences of the token, and otherwise should reject the token. A
 	// token issued for multiple audiences may be used to authenticate
 	// against any of the audiences listed but implies a high degree of
@@ -119,14 +135,17 @@ type TokenRequestSpec struct {
 	ExpirationSeconds int64
 
 	// BoundObjectRef is a reference to an object that the token will be bound to.
-	// The token will only be valid for as long as the bound objet exists.
+	// The token will only be valid for as long as the bound object exists.
+	// NOTE: The API server's TokenReview endpoint will validate the
+	// BoundObjectRef, but other audiences may not. Keep ExpirationSeconds
+	// small if you want prompt revocation.
 	BoundObjectRef *BoundObjectReference
 }
 
 // TokenRequestStatus is the result of a token request.
 type TokenRequestStatus struct {
 	// Token is the opaque bearer token.
-	Token string
+	Token string `datapolicy:"token"`
 	// ExpirationTimestamp is the time of expiration of the returned token.
 	ExpirationTimestamp metav1.Time
 }
@@ -142,4 +161,24 @@ type BoundObjectReference struct {
 	Name string
 	// UID of the referent.
 	UID types.UID
+}
+
+// +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
+
+// SelfSubjectReview contains the user information that the kube-apiserver has about the user making this request.
+// When using impersonation, users will receive the user info of the user being impersonated.  If impersonation or
+// request header authentication is used, any extra keys will have their case ignored and returned as lowercase.
+type SelfSubjectReview struct {
+	metav1.TypeMeta
+	// ObjectMeta fulfills the metav1.ObjectMetaAccessor interface so that the stock.
+	// REST handler paths work.
+	metav1.ObjectMeta
+	// Status is filled in by the server with the user attributes.
+	Status SelfSubjectReviewStatus
+}
+
+// SelfSubjectReviewStatus is filled by the kube-apiserver and sent back to a user.
+type SelfSubjectReviewStatus struct {
+	// User attributes of the user making this request.
+	UserInfo UserInfo
 }

@@ -24,6 +24,7 @@ import (
 
 // IoUtil is a mockable util for common IO operations
 type IoUtil interface {
+	ReadFile(filename string) ([]byte, error)
 	ReadDir(dirname string) ([]os.FileInfo, error)
 	Lstat(name string) (os.FileInfo, error)
 	EvalSymlinks(path string) (string, error)
@@ -31,11 +32,14 @@ type IoUtil interface {
 
 type osIOHandler struct{}
 
-//NewIOHandler Create a new IoHandler implementation
+// NewIOHandler Create a new IoHandler implementation
 func NewIOHandler() IoUtil {
 	return &osIOHandler{}
 }
 
+func (handler *osIOHandler) ReadFile(filename string) ([]byte, error) {
+	return os.ReadFile(filename)
+}
 func (handler *osIOHandler) ReadDir(dirname string) ([]os.FileInfo, error) {
 	return ioutil.ReadDir(dirname)
 }

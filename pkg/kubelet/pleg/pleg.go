@@ -17,19 +17,34 @@ limitations under the License.
 package pleg
 
 import (
+	"time"
+
 	"k8s.io/apimachinery/pkg/types"
 )
 
+// PodLifeCycleEventType define the event type of pod life cycle events.
 type PodLifeCycleEventType string
 
+type RelistDuration struct {
+	// The period for relisting.
+	RelistPeriod time.Duration
+	// The relisting threshold needs to be greater than the relisting period +
+	// the relisting time, which can vary significantly. Set a conservative
+	// threshold to avoid flipping between healthy and unhealthy.
+	RelistThreshold time.Duration
+}
+
 const (
+	// ContainerStarted - event type when the new state of container is running.
 	ContainerStarted PodLifeCycleEventType = "ContainerStarted"
-	ContainerDied    PodLifeCycleEventType = "ContainerDied"
+	// ContainerDied - event type when the new state of container is exited.
+	ContainerDied PodLifeCycleEventType = "ContainerDied"
+	// ContainerRemoved - event type when the old state of container is exited.
 	ContainerRemoved PodLifeCycleEventType = "ContainerRemoved"
 	// PodSync is used to trigger syncing of a pod when the observed change of
 	// the state of the pod cannot be captured by any single event above.
 	PodSync PodLifeCycleEventType = "PodSync"
-	// Do not use the events below because they are disabled in GenericPLEG.
+	// ContainerChanged - event type when the new state of container is unknown.
 	ContainerChanged PodLifeCycleEventType = "ContainerChanged"
 )
 
@@ -45,8 +60,22 @@ type PodLifecycleEvent struct {
 	Data interface{}
 }
 
+// PodLifecycleEventGenerator contains functions for generating pod life cycle events.
 type PodLifecycleEventGenerator interface {
 	Start()
 	Watch() chan *PodLifecycleEvent
 	Healthy() (bool, error)
+	// RequestReinspect flags the pod for reinspection on the next Relist iteration.
+	RequestReinspect(podUID types.UID)
+	// RequestRelist queues up the pod for an on-demand relist.
+	RequestRelist(podUID types.UID)
+}
+
+// podLifecycleEventGeneratorHandler contains functions that are useful for different PLEGs
+// and need not be exposed to rest of the kubelet
+type podLifecycleEventGeneratorHandler interface {
+	PodLifecycleEventGenerator
+	Stop()
+	Update(relistDuration *RelistDuration)
+	Relist()
 }

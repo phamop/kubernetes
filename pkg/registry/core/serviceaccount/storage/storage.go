@@ -17,11 +17,18 @@ limitations under the License.
 package storage
 
 import (
+	"time"
+
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/sets"
+	"k8s.io/apiserver/pkg/authentication/authenticator"
 	"k8s.io/apiserver/pkg/registry/generic"
 	genericregistry "k8s.io/apiserver/pkg/registry/generic/registry"
 	"k8s.io/apiserver/pkg/registry/rest"
 	api "k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/kubernetes/pkg/printers"
+	printersinternal "k8s.io/kubernetes/pkg/printers/internalversion"
+	printerstorage "k8s.io/kubernetes/pkg/printers/storage"
 	"k8s.io/kubernetes/pkg/registry/core/serviceaccount"
 	token "k8s.io/kubernetes/pkg/serviceaccount"
 )
@@ -32,36 +39,45 @@ type REST struct {
 }
 
 // NewREST returns a RESTStorage object that will work against service accounts.
-func NewREST(optsGetter generic.RESTOptionsGetter, issuer token.TokenGenerator, podStorage, secretStorage *genericregistry.Store) *REST {
+func NewREST(optsGetter generic.RESTOptionsGetter, issuer token.TokenGenerator, auds authenticator.Audiences, max time.Duration, podStorage, secretStorage, nodeStorage rest.Getter, extendExpiration bool, maxExtendedExpiration time.Duration) (*REST, error) {
 	store := &genericregistry.Store{
-		NewFunc:                  func() runtime.Object { return &api.ServiceAccount{} },
-		NewListFunc:              func() runtime.Object { return &api.ServiceAccountList{} },
-		DefaultQualifiedResource: api.Resource("serviceaccounts"),
+		NewFunc:                   func() runtime.Object { return &api.ServiceAccount{} },
+		NewListFunc:               func() runtime.Object { return &api.ServiceAccountList{} },
+		DefaultQualifiedResource:  api.Resource("serviceaccounts"),
+		SingularQualifiedResource: api.Resource("serviceaccount"),
 
 		CreateStrategy:      serviceaccount.Strategy,
 		UpdateStrategy:      serviceaccount.Strategy,
 		DeleteStrategy:      serviceaccount.Strategy,
 		ReturnDeletedObject: true,
+
+		TableConvertor: printerstorage.TableConvertor{TableGenerator: printers.NewTableGenerator().With(printersinternal.AddHandlers)},
 	}
 	options := &generic.StoreOptions{RESTOptions: optsGetter}
 	if err := store.CompleteWithOptions(options); err != nil {
-		panic(err) // TODO: Propagate error up
+		return nil, err
 	}
 
 	var trest *TokenREST
 	if issuer != nil && podStorage != nil && secretStorage != nil {
 		trest = &TokenREST{
-			svcaccts: store,
-			issuer:   issuer,
-			pods:     podStorage,
-			secrets:  secretStorage,
+			svcaccts:                     store,
+			pods:                         podStorage,
+			secrets:                      secretStorage,
+			nodes:                        nodeStorage,
+			issuer:                       issuer,
+			auds:                         auds,
+			audsSet:                      sets.NewString(auds...),
+			maxExpirationSeconds:         int64(max.Seconds()),
+			maxExtendedExpirationSeconds: int64(maxExtendedExpiration.Seconds()),
+			extendExpiration:             extendExpiration,
 		}
 	}
 
 	return &REST{
 		Store: store,
 		Token: trest,
-	}
+	}, nil
 }
 
 // Implement ShortNamesProvider

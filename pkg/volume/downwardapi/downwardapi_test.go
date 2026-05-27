@@ -18,9 +18,9 @@ package downwardapi
 
 import (
 	"fmt"
-	"io/ioutil"
 	"os"
-	"path"
+	"path/filepath"
+	"runtime"
 	"testing"
 
 	"k8s.io/api/core/v1"
@@ -31,7 +31,7 @@ import (
 	utiltesting "k8s.io/client-go/util/testing"
 	"k8s.io/kubernetes/pkg/fieldpath"
 	"k8s.io/kubernetes/pkg/volume"
-	"k8s.io/kubernetes/pkg/volume/empty_dir"
+	"k8s.io/kubernetes/pkg/volume/emptydir"
 	volumetest "k8s.io/kubernetes/pkg/volume/testing"
 )
 
@@ -47,7 +47,7 @@ func newTestHost(t *testing.T, clientset clientset.Interface) (string, volume.Vo
 	if err != nil {
 		t.Fatalf("can't make a temp rootdir: %v", err)
 	}
-	return tempDir, volumetest.NewFakeVolumeHost(tempDir, clientset, empty_dir.ProbeVolumePlugins())
+	return tempDir, volumetest.NewFakeVolumeHost(t, tempDir, clientset, emptydir.ProbeVolumePlugins())
 }
 
 func TestCanSupport(t *testing.T) {
@@ -58,7 +58,7 @@ func TestCanSupport(t *testing.T) {
 
 	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 	if plugin.GetPluginName() != downwardAPIPluginName {
 		t.Errorf("Wrong name: %s", plugin.GetPluginName())
@@ -72,6 +72,11 @@ func TestCanSupport(t *testing.T) {
 }
 
 func TestDownwardAPI(t *testing.T) {
+	// Skip tests that fail on Windows, as discussed during the SIG Testing meeting from January 10, 2023
+	if runtime.GOOS == "windows" {
+		t.Skip("Skipping test that fails on Windows")
+	}
+
 	labels1 := map[string]string{
 		"key1": "value1",
 		"key2": "value2",
@@ -82,8 +87,9 @@ func TestDownwardAPI(t *testing.T) {
 		"key3": "value3",
 	}
 	annotations := map[string]string{
-		"a1": "value1",
-		"a2": "value2",
+		"a1":        "value1",
+		"a2":        "value2",
+		"multiline": "c\nb\na",
 	}
 	testCases := []struct {
 		name           string
@@ -228,7 +234,7 @@ func newDownwardAPITest(t *testing.T, name string, volumeFiles, podLabels, podAn
 	pluginMgr.InitPlugins(ProbeVolumePlugins(), nil /* prober */, host)
 	plugin, err := pluginMgr.FindPluginByName(downwardAPIPluginName)
 	if err != nil {
-		t.Errorf("Can't find the plugin by name")
+		t.Fatal("Can't find the plugin by name")
 	}
 
 	volumeSpec := &v1.Volume{
@@ -242,7 +248,7 @@ func newDownwardAPITest(t *testing.T, name string, volumeFiles, podLabels, podAn
 	}
 	podMeta.UID = testPodUID
 	pod := &v1.Pod{ObjectMeta: podMeta}
-	mounter, err := plugin.NewMounter(volume.NewSpecFromVolume(volumeSpec), pod, volume.VolumeOptions{})
+	mounter, err := plugin.NewMounter(volume.NewSpecFromVolume(volumeSpec), pod)
 	if err != nil {
 		t.Errorf("Failed to make a new Mounter: %v", err)
 	}
@@ -252,7 +258,7 @@ func newDownwardAPITest(t *testing.T, name string, volumeFiles, podLabels, podAn
 
 	volumePath := mounter.GetPath()
 
-	err = mounter.SetUp(nil)
+	err = mounter.SetUp(volume.MounterArgs{})
 	if err != nil {
 		t.Errorf("Failed to setup volume: %v", err)
 	}
@@ -313,13 +319,13 @@ type stepName struct {
 func (step stepName) getName() string { return step.name }
 
 func doVerifyLinesInFile(t *testing.T, volumePath, filename string, expected string) {
-	data, err := ioutil.ReadFile(path.Join(volumePath, filename))
+	data, err := os.ReadFile(filepath.Join(volumePath, filename))
 	if err != nil {
-		t.Errorf(err.Error())
+		t.Error(err.Error())
 		return
 	}
-	actualStr := sortLines(string(data))
-	expectedStr := sortLines(expected)
+	actualStr := string(data)
+	expectedStr := expected
 	if actualStr != expectedStr {
 		t.Errorf("Found `%s`, expected `%s`", actualStr, expectedStr)
 	}
@@ -349,9 +355,9 @@ type verifyMode struct {
 }
 
 func (step verifyMode) run(test *downwardAPITest) {
-	fileInfo, err := os.Stat(path.Join(test.volumePath, step.name))
+	fileInfo, err := os.Stat(filepath.Join(test.volumePath, step.name))
 	if err != nil {
-		test.t.Errorf(err.Error())
+		test.t.Error(err.Error())
 		return
 	}
 
@@ -373,18 +379,18 @@ func (step reSetUp) run(test *downwardAPITest) {
 		test.pod.ObjectMeta.Labels = step.newLabels
 	}
 
-	currentTarget, err := os.Readlink(path.Join(test.volumePath, downwardAPIDir))
+	currentTarget, err := os.Readlink(filepath.Join(test.volumePath, downwardAPIDir))
 	if err != nil {
 		test.t.Errorf("labels file should be a link... %s\n", err.Error())
 	}
 
 	// now re-run Setup
-	if err = test.mounter.SetUp(nil); err != nil {
+	if err = test.mounter.SetUp(volume.MounterArgs{}); err != nil {
 		test.t.Errorf("Failed to re-setup volume: %v", err)
 	}
 
 	// get the link of the link
-	currentTarget2, err := os.Readlink(path.Join(test.volumePath, downwardAPIDir))
+	currentTarget2, err := os.Readlink(filepath.Join(test.volumePath, downwardAPIDir))
 	if err != nil {
 		test.t.Errorf(".current should be a link... %s\n", err.Error())
 	}

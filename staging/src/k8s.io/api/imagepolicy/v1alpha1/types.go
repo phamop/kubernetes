@@ -26,12 +26,16 @@ import (
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // ImageReview checks if the set of images in a pod are allowed.
+// +k8s:supportsSubresource="/status"
 type ImageReview struct {
-	metav1.TypeMeta `json:",inline"`
+	metav1.TypeMeta `json:""`
+	// Standard object's metadata.
+	// More info: https://git.k8s.io/community/contributors/devel/sig-architecture/api-conventions.md#metadata
 	// +optional
 	metav1.ObjectMeta `json:"metadata,omitempty" protobuf:"bytes,1,opt,name=metadata"`
 
 	// Spec holds information about the pod being evaluated
+	// +optional
 	Spec ImageReviewSpec `json:"spec" protobuf:"bytes,2,opt,name=spec"`
 
 	// Status is filled in by the backend and indicates whether the pod should be allowed.
@@ -43,6 +47,7 @@ type ImageReview struct {
 type ImageReviewSpec struct {
 	// Containers is a list of a subset of the information in each container of the Pod being created.
 	// +optional
+	// +listType=atomic
 	Containers []ImageReviewContainerSpec `json:"containers,omitempty" protobuf:"bytes,1,rep,name=containers"`
 	// Annotations is a list of key-value pairs extracted from the Pod's annotations.
 	// It only includes keys which match the pattern `*.image-policy.k8s.io/*`.
@@ -62,13 +67,20 @@ type ImageReviewContainerSpec struct {
 	// In future, we may add command line overrides, exec health check command lines, and so on.
 }
 
-// ImageReviewStatus is the result of the token authentication request.
+// ImageReviewStatus is the result of the review for the pod creation request.
 type ImageReviewStatus struct {
 	// Allowed indicates that all images were allowed to be run.
+	// +optional
 	Allowed bool `json:"allowed" protobuf:"varint,1,opt,name=allowed"`
 	// Reason should be empty unless Allowed is false in which case it
 	// may contain a short description of what is wrong.  Kubernetes
 	// may truncate excessively long errors when displaying to the user.
 	// +optional
 	Reason string `json:"reason,omitempty" protobuf:"bytes,2,opt,name=reason"`
+	// AuditAnnotations will be added to the attributes object of the
+	// admission controller request using 'AddAnnotation'.  The keys should
+	// be prefix-less (i.e., the admission controller will add an
+	// appropriate prefix).
+	// +optional
+	AuditAnnotations map[string]string `json:"auditAnnotations,omitempty" protobuf:"bytes,3,rep,name=auditAnnotations"`
 }

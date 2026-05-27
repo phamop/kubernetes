@@ -20,9 +20,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// +genclient
-// +genclient:nonNamespaced
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // SubjectAccessReview checks whether or not a user or group can perform an action.  Not filling in a
@@ -38,9 +35,6 @@ type SubjectAccessReview struct {
 	Status SubjectAccessReviewStatus
 }
 
-// +genclient
-// +genclient:nonNamespaced
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // SelfSubjectAccessReview checks whether or the current user can perform an action.  Not filling in a
@@ -57,8 +51,6 @@ type SelfSubjectAccessReview struct {
 	Status SubjectAccessReviewStatus
 }
 
-// +genclient
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // LocalSubjectAccessReview checks whether or not a user or group can perform an action in a given namespace.
@@ -95,6 +87,66 @@ type ResourceAttributes struct {
 	Subresource string
 	// Name is the name of the resource being requested for a "get" or deleted for a "delete". "" (empty) means all.
 	Name string
+	// fieldSelector describes the limitation on access based on field.  It can only limit access, not broaden it.
+	// +optional
+	FieldSelector *FieldSelectorAttributes
+	// labelSelector describes the limitation on access based on labels.  It can only limit access, not broaden it.
+	// +optional
+	LabelSelector *LabelSelectorAttributes
+}
+
+// LabelSelectorAttributes indicates a label limited access.
+// Webhook authors are encouraged to
+// * ensure rawSelector and requirements are not both set
+// * consider the requirements field if set
+// * not try to parse or consider the rawSelector field if set. This is to avoid another CVE-2022-2880 (i.e. getting different systems to agree on how exactly to parse a query is not something we want), see https://www.oxeye.io/resources/golang-parameter-smuggling-attack for more details.
+// For the *SubjectAccessReview endpoints of the kube-apiserver:
+// * If rawSelector is empty and requirements are empty, the request is not limited.
+// * If rawSelector is present and requirements are empty, the rawSelector will be parsed and limited if the parsing succeeds.
+// * If rawSelector is empty and requirements are present, the requirements should be honored
+// * If rawSelector is present and requirements are present, the request is invalid.
+type LabelSelectorAttributes struct {
+	// rawSelector is the serialization of a field selector that would be included in a query parameter.
+	// Webhook implementations are encouraged to ignore rawSelector.
+	// The kube-apiserver's *SubjectAccessReview will parse the rawSelector as long as the requirements are not present.
+	// +optional
+	RawSelector string
+
+	// requirements is the parsed interpretation of a label selector.
+	// All requirements must be met for a resource instance to match the selector.
+	// Webhook implementations should handle requirements, but how to handle them is up to the webhook.
+	// Since requirements can only limit the request, it is safe to authorize as unlimited request if the requirements
+	// are not understood.
+	// +optional
+	// +listType=atomic
+	Requirements []metav1.LabelSelectorRequirement
+}
+
+// FieldSelectorAttributes indicates a field limited access.
+// Webhook authors are encouraged to
+// * ensure rawSelector and requirements are not both set
+// * consider the requirements field if set
+// * not try to parse or consider the rawSelector field if set. This is to avoid another CVE-2022-2880 (i.e. getting different systems to agree on how exactly to parse a query is not something we want), see https://www.oxeye.io/resources/golang-parameter-smuggling-attack for more details.
+// For the *SubjectAccessReview endpoints of the kube-apiserver:
+// * If rawSelector is empty and requirements are empty, the request is not limited.
+// * If rawSelector is present and requirements are empty, the rawSelector will be parsed and limited if the parsing succeeds.
+// * If rawSelector is empty and requirements are present, the requirements should be honored
+// * If rawSelector is present and requirements are present, the request is invalid.
+type FieldSelectorAttributes struct {
+	// rawSelector is the serialization of a field selector that would be included in a query parameter.
+	// Webhook implementations are encouraged to ignore rawSelector.
+	// The kube-apiserver's *SubjectAccessReview will parse the rawSelector as long as the requirements are not present.
+	// +optional
+	RawSelector string
+
+	// requirements is the parsed interpretation of a field selector.
+	// All requirements must be met for a resource instance to match the selector.
+	// Webhook implementations should handle requirements, but how to handle them is up to the webhook.
+	// Since requirements can only limit the request, it is safe to authorize as unlimited request if the requirements
+	// are not understood.
+	// +optional
+	// +listType=atomic
+	Requirements []metav1.FieldSelectorRequirement
 }
 
 // NonResourceAttributes includes the authorization attributes available for non-resource requests to the Authorizer interface
@@ -138,7 +190,7 @@ type SelfSubjectAccessReviewSpec struct {
 	NonResourceAttributes *NonResourceAttributes
 }
 
-// SubjectAccessReviewStatus
+// SubjectAccessReviewStatus represents the current state of a SubjectAccessReview.
 type SubjectAccessReviewStatus struct {
 	// Allowed is required. True if the action would be allowed, false otherwise.
 	Allowed bool
@@ -155,9 +207,6 @@ type SubjectAccessReviewStatus struct {
 	EvaluationError string
 }
 
-// +genclient
-// +genclient:nonNamespaced
-// +genclient:noVerbs
 // +k8s:deepcopy-gen:interfaces=k8s.io/apimachinery/pkg/runtime.Object
 
 // SelfSubjectRulesReview enumerates the set of actions the current user can perform within a namespace.
@@ -177,6 +226,7 @@ type SelfSubjectRulesReview struct {
 	Status SubjectRulesReviewStatus
 }
 
+// SelfSubjectRulesReviewSpec defines the specification for SelfSubjectRulesReview.
 type SelfSubjectRulesReviewSpec struct {
 	// Namespace to evaluate rules for. Required.
 	Namespace string

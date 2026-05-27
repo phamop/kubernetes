@@ -16,8 +16,32 @@ package fs
 
 import (
 	"errors"
-	"time"
 )
+
+type Context struct {
+	// docker root directory.
+	Docker DockerContext
+	Crio   CrioContext
+	Podman PodmanContext
+}
+
+type DockerContext struct {
+	Root         string
+	Driver       string
+	DriverStatus map[string]string
+}
+
+type PodmanContext struct {
+	Root         string
+	Driver       string
+	DriverStatus map[string]string
+}
+
+type CrioContext struct {
+	Root       string
+	ImageStore string
+	Driver     string
+}
 
 type DeviceInfo struct {
 	Device string
@@ -35,6 +59,7 @@ const (
 	ZFS          FsType = "zfs"
 	DeviceMapper FsType = "devicemapper"
 	VFS          FsType = "vfs"
+	NFS          FsType = "nfs"
 )
 
 type Fs struct {
@@ -49,6 +74,8 @@ type Fs struct {
 }
 
 type DiskStats struct {
+	MajorNum        uint64
+	MinorNum        uint64
 	ReadsCompleted  uint64
 	ReadsMerged     uint64
 	SectorsRead     uint64
@@ -60,10 +87,22 @@ type DiskStats struct {
 	IoInProgress    uint64
 	IoTime          uint64
 	WeightedIoTime  uint64
+	Major           uint64
+	Minor           uint64
 }
 
-// ErrNoSuchDevice is the error indicating the requested device does not exist.
-var ErrNoSuchDevice = errors.New("cadvisor: no such device")
+type UsageInfo struct {
+	Bytes  uint64
+	Inodes uint64
+}
+
+var (
+	// ErrNoSuchDevice is the error indicating the requested device does not exist.
+	ErrNoSuchDevice = errors.New("cadvisor: no such device")
+
+	// ErrDeviceNotInPartitionsMap is the error resulting if a device could not be found in the partitions map.
+	ErrDeviceNotInPartitionsMap = errors.New("could not find device in cached partitions map")
+)
 
 type FsInfo interface {
 	// Returns capacity and free space, in bytes, of all the ext2, ext3, ext4 filesystems on the host.
@@ -72,11 +111,8 @@ type FsInfo interface {
 	// Returns capacity and free space, in bytes, of the set of mounts passed.
 	GetFsInfoForPath(mountSet map[string]struct{}) ([]Fs, error)
 
-	// Returns number of bytes occupied by 'dir'.
-	GetDirDiskUsage(dir string, timeout time.Duration) (uint64, error)
-
-	// Returns number of inodes used by 'dir'.
-	GetDirInodeUsage(dir string, timeout time.Duration) (uint64, error)
+	// GetDirUsage returns a usage information for 'dir'.
+	GetDirUsage(dir string) (UsageInfo, error)
 
 	// GetDeviceInfoByFsUUID returns the information of the device with the
 	// specified filesystem uuid. If no such device exists, this function will

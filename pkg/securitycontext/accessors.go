@@ -27,11 +27,15 @@ type PodSecurityContextAccessor interface {
 	HostNetwork() bool
 	HostPID() bool
 	HostIPC() bool
+	HostUsers() *bool
 	SELinuxOptions() *api.SELinuxOptions
 	RunAsUser() *int64
+	RunAsGroup() *int64
 	RunAsNonRoot() *bool
+	SeccompProfile() *api.SeccompProfile
 	SupplementalGroups() []int64
 	FSGroup() *int64
+	FSGroupChangePolicy() *api.PodFSGroupChangePolicy
 }
 
 // PodSecurityContextMutator allows reading and writing the values of a PodSecurityContext object
@@ -41,11 +45,15 @@ type PodSecurityContextMutator interface {
 	SetHostNetwork(bool)
 	SetHostPID(bool)
 	SetHostIPC(bool)
+	SetHostUsers(*bool)
 	SetSELinuxOptions(*api.SELinuxOptions)
 	SetRunAsUser(*int64)
+	SetRunAsGroup(*int64)
 	SetRunAsNonRoot(*bool)
+	SetSeccompProfile(*api.SeccompProfile)
 	SetSupplementalGroups([]int64)
 	SetFSGroup(*int64)
+	SetFSGroupChangePolicy(*api.PodFSGroupChangePolicy)
 
 	// PodSecurityContext returns the current PodSecurityContext object
 	PodSecurityContext() *api.PodSecurityContext
@@ -116,6 +124,19 @@ func (w *podSecurityContextWrapper) SetHostIPC(v bool) {
 	w.ensurePodSC()
 	w.podSC.HostIPC = v
 }
+func (w *podSecurityContextWrapper) HostUsers() *bool {
+	if w.podSC == nil {
+		return nil
+	}
+	return w.podSC.HostUsers
+}
+func (w *podSecurityContextWrapper) SetHostUsers(v *bool) {
+	if w.podSC == nil && v == nil {
+		return
+	}
+	w.ensurePodSC()
+	w.podSC.HostUsers = v
+}
 func (w *podSecurityContextWrapper) SELinuxOptions() *api.SELinuxOptions {
 	if w.podSC == nil {
 		return nil
@@ -142,6 +163,20 @@ func (w *podSecurityContextWrapper) SetRunAsUser(v *int64) {
 	w.ensurePodSC()
 	w.podSC.RunAsUser = v
 }
+func (w *podSecurityContextWrapper) RunAsGroup() *int64 {
+	if w.podSC == nil {
+		return nil
+	}
+	return w.podSC.RunAsGroup
+}
+func (w *podSecurityContextWrapper) SetRunAsGroup(v *int64) {
+	if w.podSC == nil && v == nil {
+		return
+	}
+	w.ensurePodSC()
+	w.podSC.RunAsGroup = v
+}
+
 func (w *podSecurityContextWrapper) RunAsNonRoot() *bool {
 	if w.podSC == nil {
 		return nil
@@ -154,6 +189,19 @@ func (w *podSecurityContextWrapper) SetRunAsNonRoot(v *bool) {
 	}
 	w.ensurePodSC()
 	w.podSC.RunAsNonRoot = v
+}
+func (w *podSecurityContextWrapper) SeccompProfile() *api.SeccompProfile {
+	if w.podSC == nil {
+		return nil
+	}
+	return w.podSC.SeccompProfile
+}
+func (w *podSecurityContextWrapper) SetSeccompProfile(p *api.SeccompProfile) {
+	if w.podSC == nil && p == nil {
+		return
+	}
+	w.ensurePodSC()
+	w.podSC.SeccompProfile = p
 }
 func (w *podSecurityContextWrapper) SupplementalGroups() []int64 {
 	if w.podSC == nil {
@@ -185,16 +233,38 @@ func (w *podSecurityContextWrapper) SetFSGroup(v *int64) {
 	w.podSC.FSGroup = v
 }
 
+func (w *podSecurityContextWrapper) FSGroupChangePolicy() *api.PodFSGroupChangePolicy {
+	if w.podSC == nil {
+		return nil
+	}
+
+	return w.podSC.FSGroupChangePolicy
+}
+
+func (w *podSecurityContextWrapper) SetFSGroupChangePolicy(v *api.PodFSGroupChangePolicy) {
+	if w.podSC == nil && v == nil {
+		return
+	}
+
+	w.ensurePodSC()
+	w.podSC.FSGroupChangePolicy = v
+}
+
+// ContainerSecurityContextAccessor allows reading the values of a SecurityContext object
 type ContainerSecurityContextAccessor interface {
 	Capabilities() *api.Capabilities
 	Privileged() *bool
+	ProcMount() api.ProcMountType
 	SELinuxOptions() *api.SELinuxOptions
 	RunAsUser() *int64
+	RunAsGroup() *int64
 	RunAsNonRoot() *bool
 	ReadOnlyRootFilesystem() *bool
+	SeccompProfile() *api.SeccompProfile
 	AllowPrivilegeEscalation() *bool
 }
 
+// ContainerSecurityContextMutator allows reading and writing the values of a SecurityContext object
 type ContainerSecurityContextMutator interface {
 	ContainerSecurityContextAccessor
 
@@ -204,15 +274,21 @@ type ContainerSecurityContextMutator interface {
 	SetPrivileged(*bool)
 	SetSELinuxOptions(*api.SELinuxOptions)
 	SetRunAsUser(*int64)
+	SetRunAsGroup(*int64)
 	SetRunAsNonRoot(*bool)
 	SetReadOnlyRootFilesystem(*bool)
+	SetSeccompProfile(*api.SeccompProfile)
 	SetAllowPrivilegeEscalation(*bool)
 }
 
+// NewContainerSecurityContextAccessor returns an accessor for the provided container security context
+// May be initialized with a nil SecurityContext
 func NewContainerSecurityContextAccessor(containerSC *api.SecurityContext) ContainerSecurityContextAccessor {
 	return &containerSecurityContextWrapper{containerSC: containerSC}
 }
 
+// NewContainerSecurityContextMutator returns a mutator for the provided container security context
+// May be initialized with a nil SecurityContext
 func NewContainerSecurityContextMutator(containerSC *api.SecurityContext) ContainerSecurityContextMutator {
 	return &containerSecurityContextWrapper{containerSC: containerSC}
 }
@@ -257,6 +333,15 @@ func (w *containerSecurityContextWrapper) SetPrivileged(v *bool) {
 	w.ensureContainerSC()
 	w.containerSC.Privileged = v
 }
+func (w *containerSecurityContextWrapper) ProcMount() api.ProcMountType {
+	if w.containerSC == nil {
+		return api.DefaultProcMount
+	}
+	if w.containerSC.ProcMount == nil {
+		return api.DefaultProcMount
+	}
+	return *w.containerSC.ProcMount
+}
 func (w *containerSecurityContextWrapper) SELinuxOptions() *api.SELinuxOptions {
 	if w.containerSC == nil {
 		return nil
@@ -283,6 +368,20 @@ func (w *containerSecurityContextWrapper) SetRunAsUser(v *int64) {
 	w.ensureContainerSC()
 	w.containerSC.RunAsUser = v
 }
+func (w *containerSecurityContextWrapper) RunAsGroup() *int64 {
+	if w.containerSC == nil {
+		return nil
+	}
+	return w.containerSC.RunAsGroup
+}
+func (w *containerSecurityContextWrapper) SetRunAsGroup(v *int64) {
+	if w.containerSC == nil && v == nil {
+		return
+	}
+	w.ensureContainerSC()
+	w.containerSC.RunAsGroup = v
+}
+
 func (w *containerSecurityContextWrapper) RunAsNonRoot() *bool {
 	if w.containerSC == nil {
 		return nil
@@ -309,6 +408,20 @@ func (w *containerSecurityContextWrapper) SetReadOnlyRootFilesystem(v *bool) {
 	w.ensureContainerSC()
 	w.containerSC.ReadOnlyRootFilesystem = v
 }
+func (w *containerSecurityContextWrapper) SeccompProfile() *api.SeccompProfile {
+	if w.containerSC == nil {
+		return nil
+	}
+	return w.containerSC.SeccompProfile
+}
+func (w *containerSecurityContextWrapper) SetSeccompProfile(p *api.SeccompProfile) {
+	if w.containerSC == nil && p == nil {
+		return
+	}
+	w.ensureContainerSC()
+	w.containerSC.SeccompProfile = p
+}
+
 func (w *containerSecurityContextWrapper) AllowPrivilegeEscalation() *bool {
 	if w.containerSC == nil {
 		return nil
@@ -323,10 +436,14 @@ func (w *containerSecurityContextWrapper) SetAllowPrivilegeEscalation(v *bool) {
 	w.containerSC.AllowPrivilegeEscalation = v
 }
 
+// NewEffectiveContainerSecurityContextAccessor returns an accessor for reading effective values
+// for the provided pod security context and container security context
 func NewEffectiveContainerSecurityContextAccessor(podSC PodSecurityContextAccessor, containerSC ContainerSecurityContextMutator) ContainerSecurityContextAccessor {
 	return &effectiveContainerSecurityContextWrapper{podSC: podSC, containerSC: containerSC}
 }
 
+// NewEffectiveContainerSecurityContextMutator returns a mutator for reading and writing effective values
+// for the provided pod security context and container security context
 func NewEffectiveContainerSecurityContextMutator(podSC PodSecurityContextAccessor, containerSC ContainerSecurityContextMutator) ContainerSecurityContextMutator {
 	return &effectiveContainerSecurityContextWrapper{podSC: podSC, containerSC: containerSC}
 }
@@ -356,6 +473,9 @@ func (w *effectiveContainerSecurityContextWrapper) SetPrivileged(v *bool) {
 		w.containerSC.SetPrivileged(v)
 	}
 }
+func (w *effectiveContainerSecurityContextWrapper) ProcMount() api.ProcMountType {
+	return w.containerSC.ProcMount()
+}
 func (w *effectiveContainerSecurityContextWrapper) SELinuxOptions() *api.SELinuxOptions {
 	if v := w.containerSC.SELinuxOptions(); v != nil {
 		return v
@@ -378,6 +498,18 @@ func (w *effectiveContainerSecurityContextWrapper) SetRunAsUser(v *int64) {
 		w.containerSC.SetRunAsUser(v)
 	}
 }
+func (w *effectiveContainerSecurityContextWrapper) RunAsGroup() *int64 {
+	if v := w.containerSC.RunAsGroup(); v != nil {
+		return v
+	}
+	return w.podSC.RunAsGroup()
+}
+func (w *effectiveContainerSecurityContextWrapper) SetRunAsGroup(v *int64) {
+	if !reflect.DeepEqual(w.RunAsGroup(), v) {
+		w.containerSC.SetRunAsGroup(v)
+	}
+}
+
 func (w *effectiveContainerSecurityContextWrapper) RunAsNonRoot() *bool {
 	if v := w.containerSC.RunAsNonRoot(); v != nil {
 		return v
@@ -395,6 +527,14 @@ func (w *effectiveContainerSecurityContextWrapper) ReadOnlyRootFilesystem() *boo
 func (w *effectiveContainerSecurityContextWrapper) SetReadOnlyRootFilesystem(v *bool) {
 	if !reflect.DeepEqual(w.ReadOnlyRootFilesystem(), v) {
 		w.containerSC.SetReadOnlyRootFilesystem(v)
+	}
+}
+func (w *effectiveContainerSecurityContextWrapper) SeccompProfile() *api.SeccompProfile {
+	return w.containerSC.SeccompProfile()
+}
+func (w *effectiveContainerSecurityContextWrapper) SetSeccompProfile(p *api.SeccompProfile) {
+	if !reflect.DeepEqual(w.SeccompProfile(), p) {
+		w.containerSC.SetSeccompProfile(p)
 	}
 }
 func (w *effectiveContainerSecurityContextWrapper) AllowPrivilegeEscalation() *bool {

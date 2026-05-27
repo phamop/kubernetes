@@ -17,12 +17,15 @@ limitations under the License.
 package subjectaccessreview
 
 import (
+	"context"
 	"errors"
+	"reflect"
 	"strings"
 	"testing"
 
-	"reflect"
-
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apiserver/pkg/authentication/user"
 	"k8s.io/apiserver/pkg/authorization/authorizer"
 	genericapirequest "k8s.io/apiserver/pkg/endpoints/request"
@@ -38,7 +41,7 @@ type fakeAuthorizer struct {
 	err      error
 }
 
-func (f *fakeAuthorizer) Authorize(attrs authorizer.Attributes) (authorizer.Decision, string, error) {
+func (f *fakeAuthorizer) Authorize(ctx context.Context, attrs authorizer.Attributes) (authorizer.Decision, string, error) {
 	f.attrs = attrs
 	return f.decision, f.reason, f.err
 }
@@ -60,7 +63,7 @@ func TestCreate(t *testing.T) {
 
 		"nonresource rejected": {
 			spec: authorizationapi.SubjectAccessReviewSpec{
-				User: "bob",
+				User:                  "bob",
 				NonResourceAttributes: &authorizationapi.NonResourceAttributes{Verb: "get", Path: "/mypath"},
 			},
 			decision: authorizer.DecisionNoOpinion,
@@ -81,7 +84,7 @@ func TestCreate(t *testing.T) {
 
 		"nonresource allowed": {
 			spec: authorizationapi.SubjectAccessReviewSpec{
-				User: "bob",
+				User:                  "bob",
 				NonResourceAttributes: &authorizationapi.NonResourceAttributes{Verb: "get", Path: "/mypath"},
 			},
 			decision: authorizer.DecisionAllow,
@@ -179,10 +182,53 @@ func TestCreate(t *testing.T) {
 			expectedAttrs: authorizer.AttributesRecord{
 				User:            &user.DefaultInfo{Name: "bob"},
 				ResourceRequest: true,
+				APIVersion:      "*",
 			},
 			expectedStatus: authorizationapi.SubjectAccessReviewStatus{
 				Allowed: false,
 				Denied:  true,
+			},
+		},
+
+		"resource denied, valid selectors": {
+			spec: authorizationapi.SubjectAccessReviewSpec{
+				User: "bob",
+				ResourceAttributes: &authorizationapi.ResourceAttributes{
+					FieldSelector: &authorizationapi.FieldSelectorAttributes{RawSelector: "foo=bar"},
+					LabelSelector: &authorizationapi.LabelSelectorAttributes{RawSelector: "key=value"},
+				},
+			},
+			decision: authorizer.DecisionDeny,
+			expectedAttrs: authorizer.AttributesRecord{
+				User:                      &user.DefaultInfo{Name: "bob"},
+				ResourceRequest:           true,
+				APIVersion:                "*",
+				FieldSelectorRequirements: fields.Requirements{{Operator: "=", Field: "foo", Value: "bar"}},
+				LabelSelectorRequirements: mustParse("key=value"),
+			},
+			expectedStatus: authorizationapi.SubjectAccessReviewStatus{
+				Allowed: false,
+				Denied:  true,
+			},
+		},
+		"resource denied, invalid selectors": {
+			spec: authorizationapi.SubjectAccessReviewSpec{
+				User: "bob",
+				ResourceAttributes: &authorizationapi.ResourceAttributes{
+					FieldSelector: &authorizationapi.FieldSelectorAttributes{RawSelector: "key in value"},
+					LabelSelector: &authorizationapi.LabelSelectorAttributes{RawSelector: "&"},
+				},
+			},
+			decision: authorizer.DecisionDeny,
+			expectedAttrs: authorizer.AttributesRecord{
+				User:            &user.DefaultInfo{Name: "bob"},
+				ResourceRequest: true,
+				APIVersion:      "*",
+			},
+			expectedStatus: authorizationapi.SubjectAccessReviewStatus{
+				Allowed:         false,
+				Denied:          true,
+				EvaluationError: `spec.resourceAttributes.fieldSelector ignored due to parse error; spec.resourceAttributes.labelSelector ignored due to parse error`,
 			},
 		},
 	}
@@ -195,7 +241,7 @@ func TestCreate(t *testing.T) {
 		}
 		storage := NewREST(auth)
 
-		result, err := storage.Create(genericapirequest.NewContext(), &authorizationapi.SubjectAccessReview{Spec: tc.spec}, rest.ValidateAllObjectFunc, false)
+		result, err := storage.Create(genericapirequest.NewContext(), &authorizationapi.SubjectAccessReview{Spec: tc.spec}, rest.ValidateAllObjectFunc, &metav1.CreateOptions{})
 		if err != nil {
 			if tc.expectedErr != "" {
 				if !strings.Contains(err.Error(), tc.expectedErr) {
@@ -206,12 +252,26 @@ func TestCreate(t *testing.T) {
 			}
 			continue
 		}
-		if !reflect.DeepEqual(auth.attrs, tc.expectedAttrs) {
-			t.Errorf("%s: expected\n%#v\ngot\n%#v", k, tc.expectedAttrs, auth.attrs)
+		gotAttrs := auth.attrs.(authorizer.AttributesRecord)
+		if tc.expectedStatus.EvaluationError != "" {
+			gotAttrs.FieldSelectorParsingErr = nil
+			gotAttrs.LabelSelectorParsingErr = nil
+		}
+		if !reflect.DeepEqual(gotAttrs, tc.expectedAttrs) {
+			t.Errorf("%s: expected\n%#v\ngot\n%#v", k, tc.expectedAttrs, gotAttrs)
 		}
 		status := result.(*authorizationapi.SubjectAccessReview).Status
 		if !reflect.DeepEqual(status, tc.expectedStatus) {
 			t.Errorf("%s: expected\n%#v\ngot\n%#v", k, tc.expectedStatus, status)
 		}
 	}
+}
+
+func mustParse(s string) labels.Requirements {
+	selector, err := labels.Parse(s)
+	if err != nil {
+		panic(err)
+	}
+	reqs, _ := selector.Requirements()
+	return reqs
 }

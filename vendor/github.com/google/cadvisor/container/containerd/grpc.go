@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//This code has been taken from containerd repo to avoid large library import
+// This code has been taken from containerd repo to avoid large library import
 package containerd
 
 import (
-	"github.com/containerd/containerd/namespaces"
-	"golang.org/x/net/context"
+	"context"
+
 	"google.golang.org/grpc"
+
+	"github.com/google/cadvisor/container/containerd/namespaces"
 )
 
 type namespaceInterceptor struct {

@@ -16,22 +16,24 @@ package containerd
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"net"
 	"sync"
 	"time"
 
 	containersapi "github.com/containerd/containerd/api/services/containers/v1"
 	tasksapi "github.com/containerd/containerd/api/services/tasks/v1"
 	versionapi "github.com/containerd/containerd/api/services/version/v1"
-	"github.com/containerd/containerd/containers"
-	"github.com/containerd/containerd/dialer"
-	"github.com/containerd/containerd/errdefs"
-	pempty "github.com/golang/protobuf/ptypes/empty"
+	tasktypes "github.com/containerd/containerd/api/types/task"
+	"github.com/containerd/errdefs/pkg/errgrpc"
 	"google.golang.org/grpc"
-)
+	"google.golang.org/grpc/backoff"
+	"google.golang.org/grpc/credentials/insecure"
+	emptypb "google.golang.org/protobuf/types/known/emptypb"
 
-const (
-	// k8sNamespace is the namespace we use to connect containerd.
-	k8sNamespace = "k8s.io"
+	"github.com/google/cadvisor/container/containerd/containers"
+	"github.com/google/cadvisor/container/containerd/pkg/dialer"
 )
 
 type client struct {
@@ -40,35 +42,64 @@ type client struct {
 	versionService   versionapi.VersionClient
 }
 
-type containerdClient interface {
+type ContainerdClient interface {
 	LoadContainer(ctx context.Context, id string) (*containers.Container, error)
 	TaskPid(ctx context.Context, id string) (uint32, error)
+	LoadTaskProcess(ctx context.Context, id string) (*tasktypes.Process, error)
+	TaskExitStatus(ctx context.Context, id string) (uint32, error)
 	Version(ctx context.Context) (string, error)
 }
 
+var (
+	ErrTaskIsInUnknownState = errors.New("containerd task is in unknown state") // used when process reported in containerd task is in Unknown State
+)
+
 var once sync.Once
-var ctrdClient containerdClient = nil
+var ctrdClient ContainerdClient = nil
+var ctrdClientErr error = nil
+
+const (
+	maxBackoffDelay   = 3 * time.Second
+	baseBackoffDelay  = 100 * time.Millisecond
+	connectionTimeout = 2 * time.Second
+	maxMsgSize        = 16 * 1024 * 1024 // 16MB
+)
 
 // Client creates a containerd client
-func Client() (containerdClient, error) {
-	var retErr error
+func Client(address, namespace string) (ContainerdClient, error) {
 	once.Do(func() {
-		gopts := []grpc.DialOption{
-			grpc.WithInsecure(),
-			grpc.WithDialer(dialer.Dialer),
-			grpc.WithBlock(),
-			grpc.WithTimeout(2 * time.Second),
-			grpc.WithBackoffMaxDelay(3 * time.Second),
+		tryConn, err := net.DialTimeout("unix", address, connectionTimeout)
+		if err != nil {
+			ctrdClientErr = fmt.Errorf("containerd: cannot unix dial containerd api service: %v", err)
+			return
 		}
-		unary, stream := newNSInterceptors(k8sNamespace)
+		tryConn.Close()
+
+		connParams := grpc.ConnectParams{
+			Backoff: backoff.DefaultConfig,
+		}
+		connParams.Backoff.BaseDelay = baseBackoffDelay
+		connParams.Backoff.MaxDelay = maxBackoffDelay
+		//nolint:staticcheck // SA1019
+		gopts := []grpc.DialOption{
+			grpc.WithTransportCredentials(insecure.NewCredentials()),
+			grpc.WithContextDialer(dialer.ContextDialer),
+			grpc.WithBlock(),
+			grpc.WithConnectParams(connParams),
+			grpc.WithDefaultCallOptions(grpc.MaxCallRecvMsgSize(maxMsgSize)),
+		}
+		unary, stream := newNSInterceptors(namespace)
 		gopts = append(gopts,
 			grpc.WithUnaryInterceptor(unary),
 			grpc.WithStreamInterceptor(stream),
 		)
 
-		conn, err := grpc.Dial(dialer.DialAddress("/var/run/containerd/containerd.sock"), gopts...)
+		ctx, cancel := context.WithTimeout(context.Background(), connectionTimeout)
+		defer cancel()
+		//nolint:staticcheck // SA1019
+		conn, err := grpc.DialContext(ctx, dialer.DialAddress(address), gopts...)
 		if err != nil {
-			retErr = err
+			ctrdClientErr = err
 			return
 		}
 		ctrdClient = &client{
@@ -77,7 +108,7 @@ func Client() (containerdClient, error) {
 			versionService:   versionapi.NewVersionClient(conn),
 		}
 	})
-	return ctrdClient, retErr
+	return ctrdClient, ctrdClientErr
 }
 
 func (c *client) LoadContainer(ctx context.Context, id string) (*containers.Container, error) {
@@ -85,7 +116,7 @@ func (c *client) LoadContainer(ctx context.Context, id string) (*containers.Cont
 		ID: id,
 	})
 	if err != nil {
-		return nil, errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
 	}
 	return containerFromProto(r.Container), nil
 }
@@ -95,26 +126,58 @@ func (c *client) TaskPid(ctx context.Context, id string) (uint32, error) {
 		ContainerID: id,
 	})
 	if err != nil {
-		return 0, errdefs.FromGRPC(err)
+		return 0, errgrpc.ToNative(err)
+	}
+	if response.Process.Status == tasktypes.Status_UNKNOWN {
+		return 0, ErrTaskIsInUnknownState
 	}
 	return response.Process.Pid, nil
 }
 
-func (c *client) Version(ctx context.Context) (string, error) {
-	response, err := c.versionService.Version(ctx, &pempty.Empty{})
+func (c *client) LoadTaskProcess(ctx context.Context, id string) (*tasktypes.Process, error) {
+	response, err := c.taskService.Get(ctx, &tasksapi.GetRequest{
+		ContainerID: id,
+	})
 	if err != nil {
-		return "", errdefs.FromGRPC(err)
+		return nil, errgrpc.ToNative(err)
+	}
+
+	return response.Process, nil
+}
+
+func (c *client) TaskExitStatus(ctx context.Context, id string) (uint32, error) {
+	response, err := c.taskService.Get(ctx, &tasksapi.GetRequest{
+		ContainerID: id,
+	})
+	if err != nil {
+		return 0, errgrpc.ToNative(err)
+	}
+	if response.Process.Status != tasktypes.Status_STOPPED {
+		return 0, fmt.Errorf("container %s has not exited (status: %v)", id, response.Process.Status)
+	}
+	return response.Process.ExitStatus, nil
+}
+
+func (c *client) Version(ctx context.Context) (string, error) {
+	response, err := c.versionService.Version(ctx, &emptypb.Empty{})
+	if err != nil {
+		return "", errgrpc.ToNative(err)
 	}
 	return response.Version, nil
 }
 
-func containerFromProto(containerpb containersapi.Container) *containers.Container {
+func containerFromProto(containerpb *containersapi.Container) *containers.Container {
 	var runtime containers.RuntimeInfo
+	var createdAt time.Time
+	// TODO: is nil check required for containerpb
 	if containerpb.Runtime != nil {
 		runtime = containers.RuntimeInfo{
 			Name:    containerpb.Runtime.Name,
 			Options: containerpb.Runtime.Options,
 		}
+	}
+	if containerpb.GetCreatedAt() != nil {
+		createdAt = containerpb.GetCreatedAt().AsTime()
 	}
 	return &containers.Container{
 		ID:          containerpb.ID,
@@ -125,5 +188,6 @@ func containerFromProto(containerpb containersapi.Container) *containers.Contain
 		Snapshotter: containerpb.Snapshotter,
 		SnapshotKey: containerpb.SnapshotKey,
 		Extensions:  containerpb.Extensions,
+		CreatedAt:   createdAt,
 	}
 }

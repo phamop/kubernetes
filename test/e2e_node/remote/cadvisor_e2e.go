@@ -22,22 +22,21 @@ import (
 	"os/exec"
 	"time"
 
-	"github.com/golang/glog"
-
-	"k8s.io/kubernetes/test/e2e_node/builder"
+	"k8s.io/klog/v2"
+	"k8s.io/kubernetes/test/utils"
 )
 
 // CAdvisorE2ERemote contains the specific functions in the cadvisor e2e test suite.
 type CAdvisorE2ERemote struct{}
 
-// InitCAdvisorE2ERemote performs initialization for cadvisor remote testing
-func InitCAdvisorE2ERemote() TestSuite {
-	return &CAdvisorE2ERemote{}
+// init performs initialization for cadvisor remote testing
+func init() {
+	RegisterTestSuite("cadvisor", &CAdvisorE2ERemote{})
 }
 
 // SetupTestPackage implements TestSuite.SetupTestPackage
 func (n *CAdvisorE2ERemote) SetupTestPackage(tardir, systemSpecName string) error {
-	cadvisorRootDir, err := builder.GetCAdvisorRootDir()
+	cadvisorRootDir, err := utils.GetCAdvisorRootDir()
 	if err != nil {
 		return err
 	}
@@ -58,17 +57,17 @@ func runCommand(command string, args ...string) error {
 	cmd.Stderr = os.Stderr
 	err := cmd.Run()
 	if err != nil {
-		return fmt.Errorf("failed to run command %s. error: %v", command, err)
+		return fmt.Errorf("failed to run command %s. error: %w", command, err)
 	}
 	return nil
 }
 
 // RunTest implements TestSuite.RunTest
-func (n *CAdvisorE2ERemote) RunTest(host, workspace, results, imageDesc, junitFilePrefix, testArgs, ginkgoArgs, systemSpecName string, timeout time.Duration) (string, error) {
+func (n *CAdvisorE2ERemote) RunTest(host, workspace, _, _, _, _, _, _, _, _ string, timeout time.Duration) (string, error) {
 	// Kill any running node processes
 	cleanupNodeProcesses(host)
 
-	glog.V(2).Infof("Starting tests on %q", host)
+	klog.V(2).Infof("Starting tests on %q", host)
 	return SSH(host, "sh", "-c", getSSHCommand(" && ",
 		fmt.Sprintf("cd %s/cadvisor", workspace),
 		fmt.Sprintf("timeout -k 30s %fs ./build/integration.sh ../results/cadvisor.log",

@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
 # Copyright 2014 The Kubernetes Authors.
 #
@@ -19,23 +19,11 @@ set -o errexit
 set -o nounset
 set -o pipefail
 
-KUBE_ROOT=$(dirname "${BASH_SOURCE}")/../..
+KUBE_ROOT=$(dirname "${BASH_SOURCE[0]}")/../..
 source "${KUBE_ROOT}/hack/lib/init.sh"
-
-# If called directly, exit.
-if [[ "${CALLED_FROM_MAIN_MAKEFILE:-""}" == "" ]]; then
-    echo "ERROR: $0 should not be run directly." >&2
-    echo >&2
-    echo "Please run this command using \"make update\""
-    exit 1
-fi
 
 SILENT=${SILENT:-true}
 ALL=${FORCE_ALL:-false}
-V=""
-if [[ "${SILENT}" != "true" ]]; then
-	V="-v"
-fi
 
 trap 'exit 1' SIGINT
 
@@ -47,33 +35,28 @@ if ! ${ALL} ; then
 	echo "Running in short-circuit mode; run with FORCE_ALL=true to force all scripts to run."
 fi
 
-"${KUBE_ROOT}/hack/godep-restore.sh" ${V}
-
-BASH_TARGETS="
-	update-generated-protobuf
+BASH_TARGETS=(
 	update-codegen
-	update-generated-runtime
-	update-generated-device-plugin
+	update-featuregates
+	update-generated-api-compatibility-data
 	update-generated-docs
-	update-generated-swagger-docs
-	update-swagger-spec
 	update-openapi-spec
-	update-api-reference-docs
-	update-staging-godeps
-	update-bazel"
+	update-gofmt
+	update-golangci-lint-config
+)
 
-for t in ${BASH_TARGETS}; do
-	echo -e "${color_yellow}Running $t${color_norm}"
+for t in "${BASH_TARGETS[@]}"; do
+	echo -e "${color_yellow:?}Running ${t}${color_norm:?}"
 	if ${SILENT} ; then
-		if ! bash "${KUBE_ROOT}/hack/$t.sh" 1> /dev/null; then
-			echo -e "${color_red}Running $t FAILED${color_norm}"
+		if ! bash "${KUBE_ROOT}/hack/${t}.sh" 1> /dev/null; then
+			echo -e "${color_red:?}Running ${t} FAILED${color_norm}"
 			if ! ${ALL}; then
 				exit 1
 			fi
 		fi
 	else
-		if ! bash "${KUBE_ROOT}/hack/$t.sh"; then
-			echo -e "${color_red}Running $t FAILED${color_norm}"
+		if ! bash "${KUBE_ROOT}/hack/${t}.sh"; then
+			echo -e "${color_red}Running ${t} FAILED${color_norm}"
 			if ! ${ALL}; then
 				exit 1
 			fi
@@ -81,4 +64,4 @@ for t in ${BASH_TARGETS}; do
 	fi
 done
 
-echo -e "${color_green}Update scripts completed successfully${color_norm}"
+echo -e "${color_green:?}Update scripts completed successfully${color_norm}"

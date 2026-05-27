@@ -25,24 +25,18 @@ import (
 	"github.com/spf13/pflag"
 
 	// libs that provide registration functions
-	"k8s.io/apiserver/pkg/util/logs"
-	"k8s.io/kubernetes/pkg/version/verflag"
-
-	// ensure libs have a chance to globally register their flags
-	_ "github.com/golang/glog"
-	_ "k8s.io/kubernetes/pkg/credentialprovider/azure"
-	_ "k8s.io/kubernetes/pkg/credentialprovider/gcp"
+	"k8s.io/component-base/logs"
+	"k8s.io/component-base/version/verflag"
 )
 
 // AddGlobalFlags explicitly registers flags that libraries (glog, verflag, etc.) register
 // against the global flagsets from "flag" and "github.com/spf13/pflag".
 // We do this in order to prevent unwanted flags from leaking into the Kubelet's flagset.
 func AddGlobalFlags(fs *pflag.FlagSet) {
-	addGlogFlags(fs)
 	addCadvisorFlags(fs)
 	addCredentialProviderFlags(fs)
 	verflag.AddFlags(fs)
-	logs.AddFlags(fs)
+	logs.AddFlags(fs, logs.SkipLoggingConfigurationFlags())
 }
 
 // normalize replaces underscores with hyphens
@@ -62,57 +56,16 @@ func register(global *flag.FlagSet, local *pflag.FlagSet, globalName string) {
 	}
 }
 
-// pflagRegister adds a flag to local that targets the Value associated with the Flag named globalName in global
-func pflagRegister(global, local *pflag.FlagSet, globalName string) {
-	if f := global.Lookup(globalName); f != nil {
-		f.Name = normalize(f.Name)
-		local.AddFlag(f)
-	} else {
-		panic(fmt.Sprintf("failed to find flag in global flagset (pflag): %s", globalName))
-	}
-}
-
 // registerDeprecated registers the flag with register, and then marks it deprecated
 func registerDeprecated(global *flag.FlagSet, local *pflag.FlagSet, globalName, deprecated string) {
 	register(global, local, globalName)
 	local.Lookup(normalize(globalName)).Deprecated = deprecated
 }
 
-// pflagRegisterDeprecated registers the flag with pflagRegister, and then marks it deprecated
-func pflagRegisterDeprecated(global, local *pflag.FlagSet, globalName, deprecated string) {
-	pflagRegister(global, local, globalName)
-	local.Lookup(normalize(globalName)).Deprecated = deprecated
-}
-
 // addCredentialProviderFlags adds flags from k8s.io/kubernetes/pkg/credentialprovider
 func addCredentialProviderFlags(fs *pflag.FlagSet) {
 	// lookup flags in global flag set and re-register the values with our flagset
-	global := pflag.CommandLine
 	local := pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
-
-	// Note this is deprecated in the library that provides it, so we just allow that deprecation
-	// notice to pass through our registration here.
-	pflagRegister(global, local, "google-json-key")
-	// TODO(#58034): This is not a static file, so it's not quite as straightforward as --google-json-key.
-	// We need to figure out how ACR users can dynamically provide pull credentials before we can deprecate this.
-	pflagRegister(global, local, "azure-container-registry-config")
-
-	fs.AddFlagSet(local)
-}
-
-// addGlogFlags adds flags from github.com/golang/glog
-func addGlogFlags(fs *pflag.FlagSet) {
-	// lookup flags in global flag set and re-register the values with our flagset
-	global := flag.CommandLine
-	local := pflag.NewFlagSet(os.Args[0], pflag.ExitOnError)
-
-	register(global, local, "logtostderr")
-	register(global, local, "alsologtostderr")
-	register(global, local, "v")
-	register(global, local, "stderrthreshold")
-	register(global, local, "vmodule")
-	register(global, local, "log_backtrace_at")
-	register(global, local, "log_dir")
 
 	fs.AddFlagSet(local)
 }

@@ -17,15 +17,22 @@ limitations under the License.
 package node
 
 import (
-	"github.com/golang/glog"
+	"time"
 
-	storagev1beta1 "k8s.io/api/storage/v1beta1"
-	utilfeature "k8s.io/apiserver/pkg/util/feature"
-	storageinformers "k8s.io/client-go/informers/storage/v1beta1"
+	"k8s.io/klog/v2"
+
+	certsv1beta1 "k8s.io/api/certificates/v1beta1"
+	corev1 "k8s.io/api/core/v1"
+	resourceapi "k8s.io/api/resource/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	"k8s.io/apimachinery/pkg/util/wait"
+	certsv1beta1informers "k8s.io/client-go/informers/certificates/v1beta1"
+	corev1informers "k8s.io/client-go/informers/core/v1"
+	resourceinformers "k8s.io/client-go/informers/resource/v1"
+	storageinformers "k8s.io/client-go/informers/storage/v1"
 	"k8s.io/client-go/tools/cache"
-	api "k8s.io/kubernetes/pkg/apis/core"
-	coreinformers "k8s.io/kubernetes/pkg/client/informers/informers_generated/internalversion/core/internalversion"
-	"k8s.io/kubernetes/pkg/features"
+	"k8s.io/dynamic-resource-allocation/resourceclaim"
+	"k8s.io/utils/ptr"
 )
 
 type graphPopulator struct {
@@ -34,33 +41,58 @@ type graphPopulator struct {
 
 func AddGraphEventHandlers(
 	graph *Graph,
-	pods coreinformers.PodInformer,
-	pvs coreinformers.PersistentVolumeInformer,
+	nodes corev1informers.NodeInformer,
+	pods corev1informers.PodInformer,
+	pvs corev1informers.PersistentVolumeInformer,
 	attachments storageinformers.VolumeAttachmentInformer,
+	slices resourceinformers.ResourceSliceInformer,
+	pcrs certsv1beta1informers.PodCertificateRequestInformer,
 ) {
 	g := &graphPopulator{
 		graph: graph,
 	}
 
-	pods.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	podHandler, _ := pods.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    g.addPod,
 		UpdateFunc: g.updatePod,
 		DeleteFunc: g.deletePod,
 	})
 
-	pvs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+	pvsHandler, _ := pvs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
 		AddFunc:    g.addPV,
 		UpdateFunc: g.updatePV,
 		DeleteFunc: g.deletePV,
 	})
 
-	if utilfeature.DefaultFeatureGate.Enabled(features.CSIPersistentVolume) {
-		attachments.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
-			AddFunc:    g.addVolumeAttachment,
-			UpdateFunc: g.updateVolumeAttachment,
-			DeleteFunc: g.deleteVolumeAttachment,
-		})
+	attachHandler, _ := attachments.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+		AddFunc:    g.addVolumeAttachment,
+		UpdateFunc: g.updateVolumeAttachment,
+		DeleteFunc: g.deleteVolumeAttachment,
+	})
+
+	synced := []cache.InformerSynced{
+		podHandler.HasSynced, pvsHandler.HasSynced, attachHandler.HasSynced,
 	}
+
+	if slices != nil {
+		sliceHandler, _ := slices.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    g.addResourceSlice,
+			UpdateFunc: nil, // Not needed, NodeName is immutable.
+			DeleteFunc: g.deleteResourceSlice,
+		})
+		synced = append(synced, sliceHandler.HasSynced)
+	}
+
+	if pcrs != nil {
+		pcrHandler, _ := pcrs.Informer().AddEventHandler(cache.ResourceEventHandlerFuncs{
+			AddFunc:    g.addPCR,
+			UpdateFunc: nil, // Not needed, spec fields are immutable.
+			DeleteFunc: g.deletePCR,
+		})
+		synced = append(synced, pcrHandler.HasSynced)
+	}
+
+	go cache.WaitForNamedCacheSync("node_authorizer", wait.NeverStop, synced...)
 }
 
 func (g *graphPopulator) addPod(obj interface{}) {
@@ -68,38 +100,49 @@ func (g *graphPopulator) addPod(obj interface{}) {
 }
 
 func (g *graphPopulator) updatePod(oldObj, obj interface{}) {
-	pod := obj.(*api.Pod)
+	pod := obj.(*corev1.Pod)
 	if len(pod.Spec.NodeName) == 0 {
 		// No node assigned
-		glog.V(5).Infof("updatePod %s/%s, no node", pod.Namespace, pod.Name)
+		klog.V(5).Infof("updatePod %s/%s, no node", pod.Namespace, pod.Name)
 		return
 	}
-	if oldPod, ok := oldObj.(*api.Pod); ok && oldPod != nil {
-		if (pod.Spec.NodeName == oldPod.Spec.NodeName) && (pod.UID == oldPod.UID) {
-			// Node and uid are unchanged, all object references in the pod spec are immutable
-			glog.V(5).Infof("updatePod %s/%s, node unchanged", pod.Namespace, pod.Name)
+	if oldPod, ok := oldObj.(*corev1.Pod); ok && oldPod != nil {
+		// Ephemeral containers can add new secret or config map references to the pod.
+		hasNewEphemeralContainers := len(pod.Spec.EphemeralContainers) > len(oldPod.Spec.EphemeralContainers)
+		if (pod.Spec.NodeName == oldPod.Spec.NodeName) && (pod.UID == oldPod.UID) &&
+			!hasNewEphemeralContainers &&
+			resourceclaim.PodStatusEqual(oldPod.Status.ResourceClaimStatuses, pod.Status.ResourceClaimStatuses) &&
+			resourceclaim.PodExtendedStatusEqual(oldPod.Status.ExtendedResourceClaimStatus, pod.Status.ExtendedResourceClaimStatus) {
+			// Node and uid are unchanged, all object references in the pod spec are immutable respectively unmodified (claim statuses).
+			klog.V(5).Infof("updatePod %s/%s, node unchanged", pod.Namespace, pod.Name)
 			return
 		}
 	}
-	glog.V(4).Infof("updatePod %s/%s for node %s", pod.Namespace, pod.Name, pod.Spec.NodeName)
+
+	klog.V(4).Infof("updatePod %s/%s for node %s", pod.Namespace, pod.Name, pod.Spec.NodeName)
+	startTime := time.Now()
 	g.graph.AddPod(pod)
+	klog.V(5).Infof("updatePod %s/%s for node %s completed in %v", pod.Namespace, pod.Name, pod.Spec.NodeName, time.Since(startTime))
 }
 
 func (g *graphPopulator) deletePod(obj interface{}) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
-	pod, ok := obj.(*api.Pod)
+	pod, ok := obj.(*corev1.Pod)
 	if !ok {
-		glog.Infof("unexpected type %T", obj)
+		klog.Infof("unexpected type %T", obj)
 		return
 	}
 	if len(pod.Spec.NodeName) == 0 {
-		glog.V(5).Infof("deletePod %s/%s, no node", pod.Namespace, pod.Name)
+		klog.V(5).Infof("deletePod %s/%s, no node", pod.Namespace, pod.Name)
 		return
 	}
-	glog.V(4).Infof("deletePod %s/%s for node %s", pod.Namespace, pod.Name, pod.Spec.NodeName)
+
+	klog.V(4).Infof("deletePod %s/%s for node %s", pod.Namespace, pod.Name, pod.Spec.NodeName)
+	startTime := time.Now()
 	g.graph.DeletePod(pod.Name, pod.Namespace)
+	klog.V(5).Infof("deletePod %s/%s for node %s completed in %v", pod.Namespace, pod.Name, pod.Spec.NodeName, time.Since(startTime))
 }
 
 func (g *graphPopulator) addPV(obj interface{}) {
@@ -107,7 +150,7 @@ func (g *graphPopulator) addPV(obj interface{}) {
 }
 
 func (g *graphPopulator) updatePV(oldObj, obj interface{}) {
-	pv := obj.(*api.PersistentVolume)
+	pv := obj.(*corev1.PersistentVolume)
 	// TODO: skip add if uid, pvc, and secrets are all identical between old and new
 	g.graph.AddPV(pv)
 }
@@ -116,9 +159,9 @@ func (g *graphPopulator) deletePV(obj interface{}) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
-	pv, ok := obj.(*api.PersistentVolume)
+	pv, ok := obj.(*corev1.PersistentVolume)
 	if !ok {
-		glog.Infof("unexpected type %T", obj)
+		klog.Infof("unexpected type %T", obj)
 		return
 	}
 	g.graph.DeletePV(pv.Name)
@@ -129,10 +172,10 @@ func (g *graphPopulator) addVolumeAttachment(obj interface{}) {
 }
 
 func (g *graphPopulator) updateVolumeAttachment(oldObj, obj interface{}) {
-	attachment := obj.(*storagev1beta1.VolumeAttachment)
+	attachment := obj.(*storagev1.VolumeAttachment)
 	if oldObj != nil {
 		// skip add if node name is identical
-		oldAttachment := oldObj.(*storagev1beta1.VolumeAttachment)
+		oldAttachment := oldObj.(*storagev1.VolumeAttachment)
 		if oldAttachment.Spec.NodeName == attachment.Spec.NodeName {
 			return
 		}
@@ -144,10 +187,52 @@ func (g *graphPopulator) deleteVolumeAttachment(obj interface{}) {
 	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
 		obj = tombstone.Obj
 	}
-	attachment, ok := obj.(*api.PersistentVolume)
+	attachment, ok := obj.(*storagev1.VolumeAttachment)
 	if !ok {
-		glog.Infof("unexpected type %T", obj)
+		klog.Infof("unexpected type %T", obj)
 		return
 	}
 	g.graph.DeleteVolumeAttachment(attachment.Name)
+}
+
+func (g *graphPopulator) addResourceSlice(obj interface{}) {
+	slice, ok := obj.(*resourceapi.ResourceSlice)
+	if !ok {
+		klog.Infof("unexpected type %T", obj)
+		return
+	}
+	g.graph.AddResourceSlice(slice.Name, ptr.Deref(slice.Spec.NodeName, ""))
+}
+
+func (g *graphPopulator) deleteResourceSlice(obj interface{}) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	slice, ok := obj.(*resourceapi.ResourceSlice)
+	if !ok {
+		klog.Infof("unexpected type %T", obj)
+		return
+	}
+	g.graph.DeleteResourceSlice(slice.Name)
+}
+
+func (g *graphPopulator) addPCR(obj any) {
+	pcr, ok := obj.(*certsv1beta1.PodCertificateRequest)
+	if !ok {
+		klog.Infof("unexpected type %T", obj)
+		return
+	}
+	g.graph.AddPodCertificateRequest(pcr)
+}
+
+func (g *graphPopulator) deletePCR(obj any) {
+	if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
+		obj = tombstone.Obj
+	}
+	pcr, ok := obj.(*certsv1beta1.PodCertificateRequest)
+	if !ok {
+		klog.Infof("unexpected type %T", obj)
+		return
+	}
+	g.graph.DeletePodCertificateRequest(pcr)
 }

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//go:build linux
+
 package cpuload
 
 import (
@@ -19,7 +21,8 @@ import (
 
 	info "github.com/google/cadvisor/info/v1"
 
-	"github.com/golang/glog"
+	"k8s.io/klog/v2"
+
 	"github.com/google/cadvisor/utils/cpuload/netlink"
 )
 
@@ -41,6 +44,6 @@ func New() (CpuLoadReader, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to create a netlink based cpuload reader: %v", err)
 	}
-	glog.V(4).Info("Using a netlink-based load reader")
+	klog.V(4).Info("Using a netlink-based load reader")
 	return reader, nil
 }

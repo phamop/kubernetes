@@ -17,99 +17,92 @@ limitations under the License.
 package autoscaling
 
 import (
-	"strings"
+	"context"
 	"time"
 
-	"k8s.io/api/core/v1"
+	v1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/kubernetes/test/e2e/common"
+	"k8s.io/kubernetes/test/e2e/feature"
 	"k8s.io/kubernetes/test/e2e/framework"
+	e2eautoscaling "k8s.io/kubernetes/test/e2e/framework/autoscaling"
+	e2enode "k8s.io/kubernetes/test/e2e/framework/node"
+	e2eskipper "k8s.io/kubernetes/test/e2e/framework/skipper"
+	admissionapi "k8s.io/pod-security-admission/api"
 
-	. "github.com/onsi/ginkgo"
-	. "github.com/onsi/gomega"
+	"github.com/onsi/ginkgo/v2"
+	"github.com/onsi/gomega/gmeasure"
 )
 
-var _ = SIGDescribe("[Feature:ClusterSizeAutoscalingScaleUp] [Slow] Autoscaling", func() {
+var _ = SIGDescribe(feature.ClusterSizeAutoscalingScaleUp, framework.WithSlow(), "Autoscaling", func() {
 	f := framework.NewDefaultFramework("autoscaling")
+	f.NamespacePodSecurityLevel = admissionapi.LevelPrivileged
+	var experiment *gmeasure.Experiment
 
-	SIGDescribe("Autoscaling a service", func() {
-		BeforeEach(func() {
+	ginkgo.Describe("Autoscaling a service", func() {
+		ginkgo.BeforeEach(func(ctx context.Context) {
 			// Check if Cloud Autoscaler is enabled by trying to get its ConfigMap.
-			_, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Get("cluster-autoscaler-status", metav1.GetOptions{})
+			_, err := f.ClientSet.CoreV1().ConfigMaps("kube-system").Get(ctx, "cluster-autoscaler-status", metav1.GetOptions{})
 			if err != nil {
-				framework.Skipf("test expects Cluster Autoscaler to be enabled")
+				e2eskipper.Skipf("test expects Cluster Autoscaler to be enabled")
 			}
+			experiment = gmeasure.NewExperiment("Autoscaling a service")
+			ginkgo.AddReportEntry(experiment.Name, experiment)
 		})
 
-		Context("from 1 pod and 3 nodes to 8 pods and >=4 nodes", func() {
-			const nodesNum = 3       // Expect there to be 3 nodes before and after the test.
-			var nodeGroupName string // Set by BeforeEach, used by AfterEach to scale this node group down after the test.
-			var nodes *v1.NodeList   // Set by BeforeEach, used by Measure to calculate CPU request based on node's sizes.
+		ginkgo.Context("from 1 pod and 3 nodes to 8 pods and >=4 nodes", func() {
+			const nodesNum = 3 // Expect there to be 3 nodes before and after the test.
 
-			BeforeEach(func() {
-				// Make sure there is only 1 node group, otherwise this test becomes useless.
-				nodeGroups := strings.Split(framework.TestContext.CloudConfig.NodeInstanceGroup, ",")
-				if len(nodeGroups) != 1 {
-					framework.Skipf("test expects 1 node group, found %d", len(nodeGroups))
-				}
-				nodeGroupName = nodeGroups[0]
-
-				// Make sure the node group has exactly 'nodesNum' nodes, otherwise this test becomes useless.
-				nodeGroupSize, err := framework.GroupSize(nodeGroupName)
+			ginkgo.BeforeEach(func(ctx context.Context) {
+				nodes, err := e2enode.GetReadySchedulableNodes(ctx, f.ClientSet)
 				framework.ExpectNoError(err)
-				if nodeGroupSize != nodesNum {
-					framework.Skipf("test expects %d nodes, found %d", nodesNum, nodeGroupSize)
+				nodeCount := len(nodes.Items)
+				if nodeCount != nodesNum {
+					e2eskipper.Skipf("test expects %d schedulable nodes, found %d", nodesNum, nodeCount)
 				}
-
-				// Make sure all nodes are schedulable, otherwise we are in some kind of a problem state.
-				nodes = framework.GetReadySchedulableNodesOrDie(f.ClientSet)
-				schedulableCount := len(nodes.Items)
-				Expect(schedulableCount).To(Equal(nodeGroupSize), "not all nodes are schedulable")
+				// As the last deferred cleanup ensure that the state is restored.
+				// AfterEach does not allow for this because it runs before other deferred
+				// cleanups happen, and they are blocking cluster restoring its initial size.
+				ginkgo.DeferCleanup(func(ctx context.Context) {
+					ginkgo.By("Waiting for scale down after test")
+					framework.ExpectNoError(e2enode.WaitForReadyNodes(ctx, f.ClientSet, nodeCount, 15*time.Minute))
+				})
 			})
 
-			AfterEach(func() {
-				// Attempt cleanup only if a node group was targeted for scale up.
-				// Otherwise the test was probably skipped and we'll get a gcloud error due to invalid parameters.
-				if len(nodeGroupName) > 0 {
-					// Scale down back to only 'nodesNum' nodes, as expected at the start of the test.
-					framework.ExpectNoError(framework.ResizeGroup(nodeGroupName, nodesNum))
-					framework.ExpectNoError(framework.WaitForReadyNodes(f.ClientSet, nodesNum, 15*time.Minute))
-				}
-			})
-
-			Measure("takes less than 15 minutes", func(b Benchmarker) {
+			ginkgo.It("takes less than 15 minutes", func(ctx context.Context) {
 				// Measured over multiple samples, scaling takes 10 +/- 2 minutes, so 15 minutes should be fully sufficient.
 				const timeToWait = 15 * time.Minute
 
 				// Calculate the CPU request of the service.
 				// This test expects that 8 pods will not fit in 'nodesNum' nodes, but will fit in >='nodesNum'+1 nodes.
 				// Make it so that 'nodesNum' pods fit perfectly per node.
+				nodes, err := e2enode.GetReadySchedulableNodes(ctx, f.ClientSet)
+				framework.ExpectNoError(err)
 				nodeCpus := nodes.Items[0].Status.Allocatable[v1.ResourceCPU]
-				nodeCpuMillis := (&nodeCpus).MilliValue()
-				cpuRequestMillis := int64(nodeCpuMillis / nodesNum)
+				nodeCPUMillis := (&nodeCpus).MilliValue()
+				cpuRequestMillis := int64(nodeCPUMillis / nodesNum)
 
 				// Start the service we want to scale and wait for it to be up and running.
 				nodeMemoryBytes := nodes.Items[0].Status.Allocatable[v1.ResourceMemory]
 				nodeMemoryMB := (&nodeMemoryBytes).Value() / 1024 / 1024
 				memRequestMB := nodeMemoryMB / 10 // Ensure each pod takes not more than 10% of node's allocatable memory.
 				replicas := 1
-				resourceConsumer := common.NewDynamicResourceConsumer("resource-consumer", f.Namespace.Name, common.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.InternalClientset)
-				defer resourceConsumer.CleanUp()
-				resourceConsumer.WaitForReplicas(replicas, 1*time.Minute) // Should finish ~immediately, so 1 minute is more than enough.
+				resourceConsumer := e2eautoscaling.NewDynamicResourceConsumer(ctx, "resource-consumer", f.Namespace.Name, e2eautoscaling.KindDeployment, replicas, 0, 0, 0, cpuRequestMillis, memRequestMB, f.ClientSet, f.ScalesGetter, e2eautoscaling.Disable, e2eautoscaling.Idle, nil)
+				ginkgo.DeferCleanup(resourceConsumer.CleanUp)
+				resourceConsumer.WaitForReplicas(ctx, replicas, 1*time.Minute) // Should finish ~immediately, so 1 minute is more than enough.
 
 				// Enable Horizontal Pod Autoscaler with 50% target utilization and
 				// scale up the CPU usage to trigger autoscaling to 8 pods for target to be satisfied.
-				targetCpuUtilizationPercent := int32(50)
-				hpa := common.CreateCPUHorizontalPodAutoscaler(resourceConsumer, targetCpuUtilizationPercent, 1, 10)
-				defer common.DeleteHorizontalPodAutoscaler(resourceConsumer, hpa.Name)
-				cpuLoad := 8 * cpuRequestMillis * int64(targetCpuUtilizationPercent) / 100 // 8 pods utilized to the target level
+				targetCPUUtilizationPercent := int32(50)
+				hpa := e2eautoscaling.CreateCPUResourceHorizontalPodAutoscaler(ctx, resourceConsumer, targetCPUUtilizationPercent, 1, 10)
+				ginkgo.DeferCleanup(e2eautoscaling.DeleteHorizontalPodAutoscaler, resourceConsumer, hpa.Name)
+				cpuLoad := 8 * cpuRequestMillis * int64(targetCPUUtilizationPercent) / 100 // 8 pods utilized to the target level
 				resourceConsumer.ConsumeCPU(int(cpuLoad))
 
 				// Measure the time it takes for the service to scale to 8 pods with 50% CPU utilization each.
-				b.Time("total scale-up time", func() {
-					resourceConsumer.WaitForReplicas(8, timeToWait)
-				})
-			}, 1) // Increase to run the test more than once.
+				experiment.SampleDuration("total scale-up time", func(idx int) {
+					resourceConsumer.WaitForReplicas(ctx, 8, timeToWait)
+				}, gmeasure.SamplingConfig{N: 1})
+			}) // Increase to run the test more than once.
 		})
 	})
 })
